@@ -12,6 +12,10 @@ import {
   RANK_MODES, RANK_COLUMNS, TYPES, PRODUCT, rankRows, nextRankSort, rankSortFor, linesText, guessTip, batchText,
   BATCH_TIP, UNVERIFIED_TIP, DIRECT_MISSING_TIP, RELEASE_TIP, TIME_NOTE, workLead, repoFigures,
 } from './model.ts';
+import {
+  searchWords, matchesSearch, personSearchFields, personMatches, matchText, peopleGroups, groupTotals, GROUP_TOTALS_TIP,
+  rankRowsOf, rankTotal, RANK_TOTALS_TIP,
+} from './model.ts';
 import type {
   DetailRow, Item, PeopleView, PersonDetail, PersonFigures, PersonRow, Rank, RankColumn, RankMode, RankRow, RepoPeople,
   StateTime, WorkState,
@@ -53,6 +57,12 @@ interface State {
   dirOpen: Set<string>;
   /** The repos whose caret is open in the Repos table. */
   repoOpen: Set<string>;
+  /** The People tab's search, as typed; not kept across launches. */
+  peopleQuery: string;
+  /** The People tab shows one section per repo. */
+  peopleGroup: boolean;
+  /** The repo sections collapsed in the grouped People tab. */
+  groupClosed: Set<string>;
 }
 
 /** The view a tab button, a shortcut or the saved view names; the Repos table for anything else. */
@@ -132,6 +142,9 @@ export function start(api: Api): () => void {
     rankOpen: new Set(),
     dirOpen: new Set(),
     repoOpen: new Set(),
+    peopleQuery: '',
+    peopleGroup: load('peopleGroup', false),
+    groupClosed: new Set(load<string[]>('groupClosed', [])),
   };
 
   function openUrl(url: string, ev?: Event): void {
@@ -457,17 +470,19 @@ export function start(api: Api): () => void {
       ' ', stateChip(i.work));
   }
 
-  function personRow(f: PersonFigures, p: PersonRow, open: boolean, repo = ''): HTMLTableRowElement {
+  /** A person's row, or with `repo` one of the per-repo rows under it. `group` is the repo section a grouped row is in. */
+  function personRow(f: PersonFigures, p: PersonRow, open: boolean, repo = '', group = ''): HTMLTableRowElement {
     const entry = state.snap?.repos.find((e) => e.repo === repo);
+    const openKey = group ? `${group}|${p.key}` : p.key;
     const first = repo
       ? el('td', { class: 'person' }, appIcon(entry ?? { repo }), ' ', shortName(repo))
       : el('td', { class: 'person' },
         el('button', {
           class: 'caret',
           'aria-expanded': String(open),
-          'aria-label': `${open ? 'Hide' : 'Show'} ${p.login} by repo`,
-          dataset: { focus: `caret:${p.key}` },
-          onclick: () => togglePerson(p.key),
+          'aria-label': `${open ? 'Hide' : 'Show'} ${group ? `${p.login}’s detail in ${shortName(group)}` : `${p.login} by repo`}`,
+          dataset: { focus: `caret:${openKey}` },
+          onclick: () => togglePerson(openKey),
         }, open ? '▾' : '▸'),
         link(p.login, `https://github.com/${p.login}`, 'who'),
         p.name ? el('span', { class: 'name', title: p.name }, p.name) : null);
@@ -487,7 +502,7 @@ export function start(api: Api): () => void {
       el('span', { title: f.awaitingFirst ? `${f.awaitingFirst} awaiting a first response` : null }, durationText(f.responseToThem), f.awaitingFirst ? el('span', { class: 'old' }, ` · ${f.awaitingFirst} waiting`) : null),
       plain(f.reviews),
     ];
-    return el('tr', { class: repo ? 'sub' : 'person-row', dataset: { key: p.key, repo } }, first, ...cells.map((c) => el('td', {}, c)));
+    return el('tr', { class: repo ? 'sub' : 'person-row', dataset: { key: p.key, repo, group } }, first, ...cells.map((c) => el('td', {}, c)));
   }
 
   /** The detail under an open person: open work by state with time in state, work waiting on them, holds, responses, reviews given and flow, in `repo` ('' for every repo). */
@@ -670,16 +685,16 @@ export function start(api: Api): () => void {
   /** An unverified marker for a count from a batch-branch repository. */
   const unverified = (on: boolean) => (on ? el('span', { class: 'unverified', title: UNVERIFIED_TIP }, '*') : null);
 
-  /** The cell of ranking column `c` for a person with figures `r`. */
-  function rankCell(c: RankColumn, row: RankRow, r: Rank, open: boolean, focusPrefix: string): Node {
+  /** The cell of ranking column `c` for a person with figures `r`. `openKey` names the caret in `state.rankOpen`. */
+  function rankCell(c: RankColumn, row: RankRow, r: Rank, open: boolean, focusPrefix: string, openKey = row.key): Node {
     const plain = (n: number) => el('span', { class: n ? '' : 'zero' }, num(n));
     switch (c.key) {
       case 'person':
         return el('span', { class: 'person' },
           focusPrefix ? el('button', {
             class: 'caret', 'aria-expanded': String(open), 'aria-label': `${open ? 'Hide' : 'Show'} where ${row.login}’s work went`,
-            dataset: { focus: `${focusPrefix}:${row.key}` },
-            onclick: () => { if (state.rankOpen.has(row.key)) state.rankOpen.delete(row.key); else state.rankOpen.add(row.key); redrawPeople(); },
+            dataset: { focus: `${focusPrefix}:${openKey}` },
+            onclick: () => { if (state.rankOpen.has(openKey)) state.rankOpen.delete(openKey); else state.rankOpen.add(openKey); redrawPeople(); },
           }, open ? '▾' : '▸') : null,
           link(row.login, `https://github.com/${row.login}`, 'who'),
           row.name ? el('span', { class: 'name', title: row.name }, row.name) : null);
@@ -711,12 +726,43 @@ export function start(api: Api): () => void {
     }
   }
 
-  /** The Rankings view: one row per person in the selected ranking and window, sortable, with a caret that opens where their work went. */
-  function renderRankings(v: PeopleView): void {
+  /** The repos `key` has figures in for the People window, which the search reads. */
+  function searchRepos(v: PeopleView, key: string, repos: readonly string[]): string[] {
+    const p = v.people.find((x) => x.key === key);
+    return p ? personRepos(v, p, state.peopleWindow, repos) : [];
+  }
+
+  function toggleGroup(repo: string): void {
+    if (state.groupClosed.has(repo)) state.groupClosed.delete(repo); else state.groupClosed.add(repo);
+    save('groupClosed', [...state.groupClosed]);
+    redrawPeople();
+  }
+
+  /** A repo section's header row: a caret that collapses it, the repo, how many people it lists, and `cells` for the other columns. */
+  function sectionRow(repo: string, count: number | null, closed: boolean, cells: string[], title: string): HTMLTableRowElement {
+    const entry = state.snap?.repos.find((e) => e.repo === repo);
+    const first = el('td', {},
+      el('button', {
+        class: 'caret', 'aria-expanded': String(!closed), 'aria-label': `${closed ? 'Show' : 'Hide'} the people of ${shortName(repo)}`,
+        dataset: { focus: `group:${repo}` }, onclick: () => toggleGroup(repo),
+      }, closed ? '▸' : '▾'),
+      el('span', { class: 'group-name' }, appIcon(entry ?? { repo }), shortName(repo)),
+      el('span', { class: 'group-count' }, count === null ? 'loading…' : `${num(count)} ${count === 1 ? 'person' : 'people'}`));
+    return el('tr', { class: 'repo-group', dataset: { group: repo }, title }, first, ...cells.map((c) => el('td', {}, c)));
+  }
+
+  /** The row under a table when nobody is listed. */
+  const noneRow = (span: number, text: string) => el('tr', {}, el('td', { colspan: span, class: 'empty' }, text));
+  const noMatch = () => `Nobody matches “${state.peopleQuery.trim()}”.`;
+
+  /** The Rankings view: one row per person in the selected ranking and window, sortable, with a caret that opens where their work went.
+   * Grouped, it shows one section per repo with each person's figures in that repo. Returns how many people it shows and lists in all,
+   * and whether a repo's people are still being asked for. */
+  function renderRankings(v: PeopleView, repos: readonly string[]): [number, number, boolean] {
     const mode = state.rankMode;
     const sort = rankSortFor(state.rankSort, mode);
     const cols = RANK_COLUMNS[mode];
-    const rows = rankRows(v, state.peopleWindow, mode, sort);
+    const words = searchWords(state.peopleQuery);
     const release = state.peopleWindow === 'release';
     const head = el('tr', { class: 'cols' }, cols.map((c) => {
       const sorted = sort.key === c.key;
@@ -727,17 +773,59 @@ export function start(api: Api): () => void {
       }, c.label);
     }));
     const body = el('tbody');
-    for (const { row, rank } of rows) {
-      const open = state.rankOpen.has(row.key);
-      body.append(el('tr', { class: 'rank-row', dataset: { key: row.key } }, cols.map((c) => el('td', {}, rankCell(c, row, rank, open, 'rank-caret')))));
-      if (open) body.append(el('tr', { class: 'detail', dataset: { key: row.key } }, el('td', { colspan: cols.length }, personTables(row.key))));
+    const addRow = ({ row, rank }: { row: RankRow; rank: Rank }, group: string) => {
+      const openKey = group ? `${group}|${row.key}` : row.key;
+      const open = state.rankOpen.has(openKey);
+      body.append(el('tr', { class: 'rank-row', dataset: { key: row.key, group } }, cols.map((c) => el('td', {}, rankCell(c, row, rank, open, 'rank-caret', openKey)))));
+      if (open) body.append(el('tr', { class: 'detail', dataset: { key: row.key, group } }, el('td', { colspan: cols.length }, personTables(row.key, group))));
+    };
+    const shown = new Set<string>();
+    const listed = new Set<string>();
+    let pending = false;
+    if (state.peopleGroup) {
+      for (const repo of repos) {
+        const rp = repoDetailOf(repo, state.peopleWindow);
+        if (rp === undefined) {
+          pending = true;
+          body.append(sectionRow(repo, null, state.groupClosed.has(repo), cols.slice(1).map(() => ''), 'Loading this repo’s people'));
+          continue;
+        }
+        const all = rp ? rankRowsOf(rp.people, rp.window, mode, sort) : [];
+        for (const { row } of all) listed.add(row.key);
+        const rows = all.filter(({ row }) => matchesSearch(words, personSearchFields(v, row, [repo])));
+        if (!rows.length) continue;
+        for (const { row } of rows) shown.add(row.key);
+        const closed = state.groupClosed.has(repo);
+        body.append(sectionRow(repo, rows.length, closed, cols.slice(1).map((c) => rankTotal(rows, c.key)), RANK_TOTALS_TIP));
+        if (!closed) for (const r of rows) addRow(r, repo);
+      }
+    } else {
+      const all = rankRows(v, state.peopleWindow, mode, sort);
+      for (const { row } of all) listed.add(row.key);
+      // A repo matches the people its section lists when grouped: the ones
+      // with figures for this ranking in its `repo_detail`, which is read the
+      // first time a person's names leave a word unmatched.
+      let members: Map<string, Set<string>> | null = null;
+      const rankRepos = (key: string): string[] => {
+        members ??= new Map(repos.map((repo) => {
+          const rp = repoDetailOf(repo, state.peopleWindow);
+          if (rp === undefined) pending = true;
+          return [repo, new Set(rp ? rankRowsOf(rp.people, rp.window, mode, sort).map(({ row }) => row.key) : [])];
+        }));
+        return repos.filter((repo) => members!.get(repo)!.has(key));
+      };
+      const rows = all.filter(({ row }) => personMatches(v, row, words, () => rankRepos(row.key)));
+      for (const r of rows) { shown.add(r.row.key); addRow(r, ''); }
     }
-    if (!rows.length) body.append(el('tr', {}, el('td', { colspan: cols.length, class: 'empty' }, 'Nobody has anything in this ranking in this window.')));
+    if (!body.childElementCount) {
+      body.append(noneRow(cols.length, words.length ? (pending ? 'Looking up each repo’s people…' : noMatch()) : 'Nobody has anything in this ranking in this window.'));
+    }
     const notes: Node[] = [];
     const co = Object.entries(v.co_unlinked?.[state.peopleWindow] ?? {});
     if (co.length) notes.push(el('p', { class: 'muted small' }, `Co-authors without a known account: ${co.map(([n, c]) => `${n} (${c})`).join(', ')}.`));
     if (v.unlinked?.length) notes.push(el('p', { class: 'muted small', id: 'rank-unlinked' }, `Not linked to a GitHub account: ${v.unlinked.join(', ')}.`));
     $('people-main').replaceChildren(el('table', { class: 'people-table', id: 'rank-table' }, el('thead', {}, head), body), ...notes);
+    return [shown.size, listed.size, pending];
   }
 
   function renderPeople(snap: Snapshot): void {
@@ -775,22 +863,29 @@ export function start(api: Api): () => void {
       ? '? marks a type set by a fallback rule, * an unverified count. Hover a header for what it counts.'
       : 'Dotted states were read from comment text, not from GitHub fields; ? marks low confidence. Hover a state for its rule and sentence.';
     hint.title = hint.textContent;
+    $<HTMLInputElement>('people-group').checked = state.peopleGroup;
+    const search = $<HTMLInputElement>('people-search');
+    if (search.value !== state.peopleQuery) search.value = state.peopleQuery;
+    const words = searchWords(state.peopleQuery);
+    const matches = $('people-matches');
     const v = state.people;
     const cached = $('people-cached');
     cached.textContent = cachedText(v);
     cached.title = cached.textContent;
     const focused = (document.activeElement as HTMLElement | null)?.dataset?.focus;
     if (!v) {
+      matches.textContent = '';
       $('people-main').replaceChildren(el('p', { class: 'empty' }, NO_RECORDS));
       return;
     }
     if (ranking) {
-      renderRankings(v);
+      const [shown, listed, pending] = renderRankings(v, repos);
+      // A repo still being asked for can add matches, so the count waits for it.
+      matches.textContent = pending ? '' : matchText(shown, listed, words);
       if (focused) [...document.querySelectorAll<HTMLElement>('#people-main [data-focus]')].find((n) => n.dataset.focus === focused)?.focus();
       return;
     }
     const now = Date.now();
-    const rows = peopleRows(v, state.peopleWindow, state.peopleRepo, state.peopleSort);
     const head = el('tr', { class: 'cols' }, PEOPLE_COLUMNS.map((c) => {
       const sorted = state.peopleSort.key === c.key;
       return el('th', {
@@ -800,17 +895,46 @@ export function start(api: Api): () => void {
       }, c.label);
     }));
     const body = el('tbody');
-    for (const f of rows) {
-      const p = v.people.find((x) => x.key === f.key)!;
-      const open = state.peopleOpen.has(f.key);
-      body.append(personRow(f, p, open));
-      if (!open) continue;
-      for (const repo of personRepos(v, p, state.peopleWindow, state.peopleRepo ? [] : repos)) {
-        body.append(personRow(personFigures(v, p, state.peopleWindow, repo), p, false, repo));
+    const span = PEOPLE_COLUMNS.length;
+    const personOf = (key: string) => v.people.find((x) => x.key === key)!;
+    const shownRepos = state.peopleRepo ? [state.peopleRepo] : repos;
+    if (state.peopleGroup) {
+      const groups = peopleGroups(v, state.peopleWindow, shownRepos, state.peopleSort,
+        (p, repo) => matchesSearch(words, personSearchFields(v, p, [repo])));
+      const listed = words.length ? new Set(peopleGroups(v, state.peopleWindow, shownRepos, state.peopleSort).flatMap((g) => g.rows.map((f) => f.key))) : null;
+      const shown = new Set(groups.flatMap((g) => g.rows.map((f) => f.key)));
+      matches.textContent = matchText(shown.size, (listed ?? shown).size, words);
+      for (const g of groups) {
+        const closed = state.groupClosed.has(g.repo);
+        const totals = groupTotals(g.rows);
+        body.append(sectionRow(g.repo, g.rows.length, closed, PEOPLE_COLUMNS.slice(1).map((c) => {
+          const n = totals[c.key];
+          return n === undefined ? '' : num(n);
+        }), GROUP_TOTALS_TIP));
+        if (closed) continue;
+        for (const f of g.rows) {
+          const p = personOf(f.key);
+          const open = state.peopleOpen.has(`${g.repo}|${f.key}`);
+          body.append(personRow(f, p, open, '', g.repo));
+          if (open) body.append(el('tr', { class: 'detail', dataset: { key: p.key, group: g.repo } }, el('td', { colspan: span }, personDetail(v, p, f, now, g.repo))));
+        }
       }
-      body.append(el('tr', { class: 'detail', dataset: { key: p.key } }, el('td', { colspan: PEOPLE_COLUMNS.length }, personDetail(v, p, f, now, state.peopleRepo))));
+    } else {
+      const all = peopleRows(v, state.peopleWindow, state.peopleRepo, state.peopleSort);
+      const rows = all.filter((f) => personMatches(v, f, words, () => searchRepos(v, f.key, shownRepos)));
+      matches.textContent = matchText(rows.length, all.length, words);
+      for (const f of rows) {
+        const p = personOf(f.key);
+        const open = state.peopleOpen.has(f.key);
+        body.append(personRow(f, p, open));
+        if (!open) continue;
+        for (const repo of personRepos(v, p, state.peopleWindow, state.peopleRepo ? [] : repos)) {
+          body.append(personRow(personFigures(v, p, state.peopleWindow, repo), p, false, repo));
+        }
+        body.append(el('tr', { class: 'detail', dataset: { key: p.key } }, el('td', { colspan: span }, personDetail(v, p, f, now, state.peopleRepo))));
+      }
     }
-    if (!rows.length) body.append(el('tr', {}, el('td', { colspan: PEOPLE_COLUMNS.length, class: 'empty' }, 'Nobody has open work or activity here in this window.')));
+    if (!body.childElementCount) body.append(noneRow(span, words.length ? noMatch() : 'Nobody has open work or activity here in this window.'));
     $('people-main').replaceChildren(el('table', { class: 'people-table', id: 'people-table' }, el('thead', {}, head), body));
     if (focused) [...document.querySelectorAll<HTMLElement>('#people-table [data-focus]')].find((n) => n.dataset.focus === focused)?.focus();
   }
@@ -1099,6 +1223,36 @@ export function start(api: Api): () => void {
     state.rankSort = { key, dir: key === 'person' ? 'asc' : 'desc' };
     save('rankSort', state.rankSort);
     redrawPeople();
+  });
+  $('people-group').addEventListener('change', (e) => {
+    state.peopleGroup = (e.target as HTMLInputElement).checked;
+    save('peopleGroup', state.peopleGroup);
+    redrawPeople();
+  });
+  $('people-search').addEventListener('input', (e) => {
+    state.peopleQuery = (e.target as HTMLInputElement).value;
+    $('people-main').scrollTop = 0;
+    redrawPeople();
+  });
+  // In the People tab, Esc clears the search and then leaves its box before
+  // the shortcut handler below hides the window; ⌘F moves to the box. This
+  // listener is added first, so it sees each key first.
+  document.addEventListener('keydown', (e) => {
+    if (state.view !== 'people') return;
+    const search = $<HTMLInputElement>('people-search');
+    if (e.key === 'Escape' && (state.peopleQuery || document.activeElement === search)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (state.peopleQuery) {
+        state.peopleQuery = '';
+        search.value = '';
+        redrawPeople();
+      } else search.blur();
+    } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
+      e.preventDefault();
+      search.focus();
+      search.select();
+    }
   });
   api.listen<PeopleView>('craft:people', (v) => {
     state.people = v;

@@ -11,6 +11,10 @@ import {
   rankSortFor, PRODUCT, loadText, linesText, batchText, guessTip, workLead, repoFigures,
 } from './model.ts';
 import type { Flow, Given, Item, PeopleView, PersonResponse, PersonRow, Rank, RankRow, WorkState } from './model.ts';
+import {
+  searchWords, matchesSearch, personSearchFields, personMatches, matchText, peopleGroups, groupTotals, rankRowsOf, rankTotal,
+  RANK_TOTALS_TIP,
+} from './model.ts';
 
 const entry = (repo: string, stats: Partial<RepoStats> | null, fetched_at: string | null = '2026-10-08T12:00:00Z'): RepoEntry =>
   ({ repo: `o/${repo}`, stats: stats as RepoStats | null, fetched_at });
@@ -276,6 +280,7 @@ const peopleView = (): PeopleView => ({
   rankings: [],
   co_unlinked: {},
   unlinked: [],
+  discord: {},
   load: { merged: 0, total: null, closed: 0, closed_total: null, done: true },
   checked: {},
   repos: {},
@@ -534,4 +539,77 @@ test('a repo’s figures group its open work, queues, holds, health and flow', (
   assert.equal(f.flow?.merged, 3);
   assert.deepEqual(f.main?.failing, ['test']);
   assert.equal(repoFigures(v, 'o/beta', '7d', PNOW).flow, null);
+});
+
+// ───────────────────────────── search and groups ─────────────────────────────
+
+test('the People search matches every word against the login, the roster and Discord names, and repos', () => {
+  const v = { ...peopleView(), discord: { 'ann-example': 'ann_d' } };
+  const ann = v.people[0]!;
+  const fields = personSearchFields(v, ann, ['o/alpha']);
+  const hit = (q: string) => matchesSearch(searchWords(q), fields);
+  assert.deepEqual(searchWords('  Ann   ALPHA '), ['ann', 'alpha']);
+  assert.ok(hit(''), 'no words match everyone');
+  assert.ok(hit('ann-ex'), 'the login, in any case');
+  assert.ok(hit('ANN'), 'the roster name');
+  assert.ok(hit('ann_d'), 'the Discord name');
+  assert.ok(hit('alpha'), 'a repo by short name');
+  assert.ok(hit('o/alpha'), 'and by full name');
+  assert.ok(hit('ann alpha'), 'every word in some field');
+  assert.ok(!hit('ann beta'), 'beta is not one of their repos');
+  assert.ok(!hit('bo-ex'));
+  assert.ok(!matchesSearch(['ann_d'], personSearchFields(peopleView(), ann, [])), 'a view without Discord names matches none');
+  const asked = { n: 0 };
+  const repos = () => { asked.n += 1; return ['o/alpha']; };
+  assert.ok(personMatches(v, ann, ['ann'], repos));
+  assert.equal(asked.n, 0, 'a name match does not list their repos');
+  assert.ok(personMatches(v, ann, ['ann', 'alpha'], repos));
+  assert.equal(asked.n, 1, 'a word only a repo matches does');
+  assert.ok(!personMatches(v, ann, ['beta'], repos));
+  assert.equal(matchText(2, 12, ['x']), '2 of 12 people');
+  assert.equal(matchText(1, 1, ['x']), '1 of 1 person');
+  assert.equal(matchText(1200, 1500, ['x']), '1,200 of 1,500 people');
+  assert.equal(matchText(12, 12, []), '', 'no search, no count');
+});
+
+test('the grouped Work view lists each repo’s people with that repo’s figures, sorted, searched and totaled', () => {
+  const v = peopleView();
+  const sort = { key: 'open', dir: 'desc' } as const;
+  const groups = peopleGroups(v, '7d', ['o/alpha', 'o/beta', 'o/gamma'], sort);
+  assert.deepEqual(groups.map((g) => g.repo), ['o/alpha', 'o/beta'], 'a repo with nobody is left out');
+  assert.deepEqual(groups[0]!.rows.map((f) => [f.key, f.open]), [['ann-example', 2], ['boss-one', 0]]);
+  assert.deepEqual(groups[1]!.rows.map((f) => [f.key, f.open]), [['bo-example', 2], ['ann-example', 1], ['maint-one', 0]]);
+  const byName = peopleGroups(v, '7d', ['o/beta'], { key: 'person', dir: 'asc' });
+  assert.deepEqual(byName[0]!.rows.map((f) => f.key), ['ann-example', 'bo-example', 'maint-one']);
+  const searched = peopleGroups(v, '7d', ['o/alpha', 'o/beta'], sort, (p) => matchesSearch(['bo-ex'], personSearchFields(v, p, [])));
+  assert.deepEqual(searched.map((g) => [g.repo, g.rows.map((f) => f.key)]), [['o/beta', ['bo-example']]]);
+  assert.deepEqual(groupTotals(groups[1]!.rows), { open: 3, on_others: 2, held: 0, merged: 0, landed: 0, closed: 0, reviews: 1 });
+});
+
+test('grouped rankings sort any list of rows and total the columns that add up', () => {
+  const list = [
+    rrow('ann', { '7d': rk({ merged: 2, added: 10, removed: 5, types: { feature: 1, fix: 1 } }) }),
+    rrow('bo', { '7d': rk({ merged: 1, added: 40, direct: 3, types: { docs: 1 } }) }),
+    rrow('cy', { '7d': rk({ merges: 4 }) }),
+  ];
+  const rows = rankRowsOf(list, '7d', 'merged', { key: 'lines', dir: 'desc' });
+  assert.deepEqual(rows.map((r) => r.row.key), ['bo', 'ann']);
+  assert.equal(rankTotal(rows, 'merged'), '3');
+  assert.equal(rankTotal(rows, 'lines'), '+50 −5');
+  assert.equal(rankTotal(rows, 'direct'), '3');
+  assert.equal(rankTotal(rows.slice(1), 'direct'), '', 'nobody counted');
+  assert.equal(rankTotal(rows, PRODUCT), '2');
+  assert.equal(rankTotal(rows, 'type:docs'), '1');
+  assert.equal(rankTotal(rows, 'person'), '');
+  // Both review pull request #5 on the same day, and one commit names both as co-authors.
+  const shared = rk({ reviews: 1, reviewed_prs: 1, active_days: 1, co_authored: 1 });
+  const pair = [rrow('ann', { '7d': shared }), rrow('bo', { '7d': shared })];
+  const merged = rankRowsOf(pair, '7d', 'merged', { key: 'person', dir: 'asc' });
+  const maint = rankRowsOf(pair, '7d', 'maintainer', { key: 'person', dir: 'asc' });
+  assert.deepEqual([merged.length, maint.length], [2, 2]);
+  assert.equal(rankTotal(merged, 'co_authored'), '');
+  assert.equal(rankTotal(merged, 'active_days'), '');
+  assert.equal(rankTotal(maint, 'reviewed_prs'), '');
+  assert.equal(rankTotal(maint, 'reviews'), '2', 'each review has one author and adds up');
+  assert.match(RANK_TOTALS_TIP, /Co-authored, Active days and PRs reviewed do not add up/);
 });

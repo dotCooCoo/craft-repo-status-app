@@ -399,6 +399,7 @@ const people = (): PeopleView => ({
   ],
   co_unlinked: { '7d': { 'Cy Unlinked': 2 } },
   unlinked: ['Roster Only'],
+  discord: {},
   load: { merged: 9747, total: 9747, closed: 120, closed_total: 120, done: true },
   checked: { 'o/alpha': NOW },
   repos: {
@@ -839,4 +840,213 @@ test('a repo caret keeps the keyboard focus when its row is drawn again', async 
   const later = new Date(Date.parse(NOW) + 5 * 60e3).toISOString();
   h.emit('craft:snapshot', snapshot([repo('alpha', { urgency: 100 }, { fetched_at: later }), repo('beta', {}), repo('gamma', {})]));
   assert.equal((h.doc.activeElement as HTMLElement | null)?.dataset?.focus, 'repo-caret:o/alpha', 'the caret has the focus');
+});
+
+// ───────────────────────────── search and groups ─────────────────────────────
+
+/** Types `text` into a field as the user would, replacing what it held. */
+function typeInto(h: Harness, input: HTMLInputElement, text: string): void {
+  input.value = text;
+  input.dispatchEvent(new h.win.Event('input', { bubbles: true }) as unknown as Event);
+}
+
+/** Ticks or clears a checkbox as the user would. */
+function setChecked(h: Harness, input: HTMLInputElement, on: boolean): void {
+  input.checked = on;
+  input.dispatchEvent(new h.win.Event('change', { bubbles: true }) as unknown as Event);
+}
+
+const peopleSearch = (h: Harness) => h.doc.getElementById('people-search') as HTMLInputElement;
+const groupBox = (h: Harness) => h.doc.getElementById('people-group') as HTMLInputElement;
+/** The keys of the person rows in repo section `repo`. */
+const groupKeys = (h: Harness, table: string, repo: string) =>
+  [...h.doc.querySelectorAll<HTMLElement>(`#${table} tr[data-group="${repo}"]:not(.repo-group):not(.detail)`)].map((r) => r.dataset.key);
+const sections = (h: Harness, table: string) => [...h.doc.querySelectorAll<HTMLElement>(`#${table} tr.repo-group`)].map((r) => r.dataset.group);
+const hides = (h: Harness) => h.calls.filter((c) => c.cmd === 'hide_window').length;
+
+test('the People search filters Work and Rankings as you type, counts the matches, and Esc clears it first', async () => {
+  const h = await setup({
+    storage: { peopleWindow: '7d' },
+    host: (cmd) => (cmd === 'get_people' ? { ...people(), discord: { 'bo-example': 'bo_d' } } : undefined),
+  });
+  keydown(h, '4', true);
+  const search = peopleSearch(h);
+  const matches = h.doc.getElementById('people-matches')!;
+  assert.equal(matches.textContent, '', 'no search, no count');
+  keydown(h, 'f', true);
+  assert.ok(h.doc.activeElement === search, '⌘F focuses the search');
+  typeInto(h, search, 'ANN');
+  assert.deepEqual(personRows(h), ['ann-example'], 'by login or roster name, in any case');
+  assert.equal(matches.textContent, '1 of 4 people');
+  h.emit('craft:snapshot', snapshot());
+  assert.deepEqual(personRows(h), ['ann-example'], 'a snapshot keeps the search');
+  typeInto(h, search, 'bo_d');
+  assert.deepEqual(personRows(h), ['bo-example'], 'by the roster’s Discord name');
+  typeInto(h, search, 'beta');
+  assert.deepEqual(personRows(h), ['ann-example', 'maint-one', 'bo-example'], 'by a repo they have figures in');
+  typeInto(h, search, 'nobody-here');
+  assert.match(h.doc.getElementById('people-main')!.textContent!, /Nobody matches “nobody-here”\./);
+  (h.doc.querySelector('#people-view .seg[data-pmode="rankings"]') as HTMLElement).click();
+  typeInto(h, search, 'ann');
+  assert.deepEqual(rankKeys(h), ['ann-example'], 'the rankings take the same search');
+  assert.equal(matches.textContent, '', 'no count while the repos are asked for the others');
+  await tick();
+  assert.equal(matches.textContent, '1 of 3 people');
+  keydown(h, 'Escape');
+  assert.equal(search.value, '');
+  assert.equal(matches.textContent, '');
+  assert.deepEqual(rankKeys(h), ['ann-example', 'bo-example', 'maint-one']);
+  assert.equal(hides(h), 0, 'the first Esc clears the search');
+  keydown(h, 'Escape');
+  assert.ok(h.doc.activeElement !== search, 'the next leaves the box');
+  assert.equal(hides(h), 0);
+  keydown(h, 'Escape');
+  assert.equal(hides(h), 1, 'and only then does Esc hide the window');
+  keydown(h, '1', true);
+  keydown(h, 'f', true);
+  assert.ok(h.doc.activeElement !== search, '⌘F does nothing outside the People tab');
+  typeInto(h, search, 'ann');
+  keydown(h, 'Escape');
+  assert.equal(hides(h), 2, 'outside the People tab Esc hides the window at once');
+});
+
+test('Group by repo shows each repo’s people with that repo’s figures, totals, collapsing, sorting and search', async () => {
+  const h = await peopleSetup();
+  setChecked(h, groupBox(h), true);
+  assert.equal(stored(h, 'peopleGroup'), true, 'remembered');
+  assert.deepEqual(sections(h, 'people-table'), ['o/alpha', 'o/beta'], 'gamma has nobody');
+  assert.deepEqual(groupKeys(h, 'people-table', 'o/alpha'), ['ann-example', 'boss-one']);
+  assert.deepEqual(groupKeys(h, 'people-table', 'o/beta'), ['ann-example', 'maint-one', 'bo-example']);
+  const head = h.doc.querySelector<HTMLTableRowElement>('#people-table tr.repo-group[data-group="o/alpha"]')!;
+  assert.match(head.cells[0]!.textContent!, /alpha.*2 people/);
+  assert.deepEqual([head.cells[1]!.textContent, head.cells[2]!.textContent, head.cells[5]!.textContent], ['2', '', '2'], 'open and merged add up; on them is blank');
+  assert.match(head.title, /On them, To merge, Landed, They answer and First response do not add up/);
+  const annAlpha = h.doc.querySelector<HTMLTableRowElement>('#people-table tr.person-row[data-group="o/alpha"][data-key="ann-example"]')!;
+  assert.equal(annAlpha.cells[1]!.textContent, '2 (2 from comments)', 'that repo’s figures');
+  // A person's caret opens their detail in that repo.
+  annAlpha.querySelector<HTMLButtonElement>('.caret')!.click();
+  const open = h.doc.querySelector('#people-table tr.detail[data-group="o/alpha"]')!;
+  assert.deepEqual([...open.querySelectorAll('.oldest .wstate')].map((n) => n.textContent), ['Changes requested', 'Held for owner']);
+  assert.deepEqual(hostCalls(h).filter((c) => c.cmd === 'person_detail').at(-1)!.args, { login: 'ann-example', window: '7d', repo: 'o/alpha' },
+    'where their work went, in that repo');
+  assert.ok([...open.querySelectorAll('h4')].some((n) => n.textContent === 'Where their work went in alpha, last week'));
+  assert.equal(h.doc.querySelector('#people-table tr.detail[data-group="o/beta"]'), null, 'the same person in beta stays closed');
+  // A header sorts inside each section.
+  [...h.doc.querySelectorAll<HTMLElement>('#people-table th')].find((th) => th.textContent === 'Person')!.click();
+  assert.deepEqual(groupKeys(h, 'people-table', 'o/beta'), ['ann-example', 'bo-example', 'maint-one']);
+  // The section caret collapses it, keeps its focus, and is remembered.
+  const sectionCaret = () => h.doc.querySelector<HTMLButtonElement>('#people-table tr.repo-group[data-group="o/beta"] .caret')!;
+  sectionCaret().focus();
+  sectionCaret().click();
+  assert.deepEqual(groupKeys(h, 'people-table', 'o/beta'), []);
+  assert.equal(sectionCaret().getAttribute('aria-expanded'), 'false');
+  assert.equal((h.doc.activeElement as HTMLElement).dataset.focus, 'group:o/beta');
+  assert.deepEqual(stored(h, 'groupClosed'), ['o/beta']);
+  sectionCaret().click();
+  // The search applies inside sections; a repo's name shows its whole section.
+  typeInto(h, peopleSearch(h), 'maint');
+  assert.deepEqual(sections(h, 'people-table'), ['o/beta']);
+  assert.deepEqual(groupKeys(h, 'people-table', 'o/beta'), ['maint-one']);
+  assert.equal(h.doc.getElementById('people-matches')!.textContent, '1 of 4 people');
+  typeInto(h, peopleSearch(h), 'alpha');
+  assert.deepEqual(sections(h, 'people-table'), ['o/alpha']);
+  assert.deepEqual(groupKeys(h, 'people-table', 'o/alpha'), ['ann-example', 'boss-one']);
+  setChecked(h, groupBox(h), false);
+  assert.equal(h.doc.querySelector('#people-table tr.repo-group'), null, 'ungrouped again');
+  assert.equal(stored(h, 'peopleGroup'), false);
+});
+
+test('grouped Rankings ask each repo for its people and show that repo’s figures, sorted, totaled and searched', async () => {
+  const perRepo = (repo: string, window: string): RepoPeople => ({
+    repo, window, batch: false,
+    people: repo === 'o/alpha'
+      ? [rankRow('ann-example', { [window]: rank({ merged: 2, added: 30, removed: 1 }) }, { login: 'Ann-Example', name: 'Ann' }),
+        rankRow('bo-example', { [window]: rank({ merged: 1, added: 500 }) })]
+      : repo === 'o/beta' ? [rankRow('bo-example', { [window]: rank({ merged: 1, added: 9 }) })] : [],
+  });
+  const h = await setup({
+    storage: { peopleWindow: '7d', peopleMode: 'rankings', peopleGroup: true },
+    host: (cmd, args) => (cmd === 'get_people' ? people() : cmd === 'repo_detail' ? perRepo(String(args?.repo), String(args?.window)) : undefined),
+  });
+  keydown(h, '4', true);
+  assert.equal(groupBox(h).checked, true, 'the saved choice');
+  assert.deepEqual(hostCalls(h).filter((c) => c.cmd === 'repo_detail').map((c) => c.args), ['o/alpha', 'o/beta', 'o/gamma'].map((repo) => ({ repo, window: '7d' })));
+  assert.match(h.doc.getElementById('rank-table')!.textContent!, /loading…/);
+  await tick();
+  assert.deepEqual(sections(h, 'rank-table'), ['o/alpha', 'o/beta']);
+  assert.deepEqual(groupKeys(h, 'rank-table', 'o/alpha'), ['ann-example', 'bo-example'], 'most merged first');
+  const head = h.doc.querySelector<HTMLTableRowElement>('#rank-table tr.repo-group[data-group="o/alpha"]')!;
+  assert.deepEqual([head.cells[1]!.textContent, head.cells[3]!.textContent], ['3', '+530 −1'], 'Merged and Lines totals');
+  [...h.doc.querySelectorAll<HTMLElement>('#rank-table th')].find((th) => th.textContent === 'Lines')!.click();
+  assert.deepEqual(groupKeys(h, 'rank-table', 'o/alpha'), ['bo-example', 'ann-example']);
+  // A person's caret in a section shows where their work went in that repo.
+  h.doc.querySelector<HTMLButtonElement>('#rank-table tr.rank-row[data-group="o/beta"][data-key="bo-example"] .caret')!.click();
+  assert.deepEqual(hostCalls(h).filter((c) => c.cmd === 'person_detail').at(-1)!.args, { login: 'bo-example', window: '7d', repo: 'o/beta' });
+  assert.ok(h.doc.querySelector('#rank-table tr.detail[data-group="o/beta"]'));
+  assert.equal(h.doc.querySelector('#rank-table tr.detail[data-group="o/alpha"]'), null, 'the same person in alpha stays closed');
+  typeInto(h, peopleSearch(h), 'bo-ex');
+  assert.deepEqual(sections(h, 'rank-table'), ['o/alpha', 'o/beta']);
+  assert.deepEqual(groupKeys(h, 'rank-table', 'o/alpha'), ['bo-example']);
+  assert.equal(h.doc.getElementById('people-matches')!.textContent, '1 of 2 people');
+});
+
+test('grouped Rankings keep their rows, open details and focus through a new People view, and show the new answers when they arrive', async () => {
+  let polls = 0;
+  const perRepo = (repo: string, window: string): RepoPeople => ({
+    repo, window, batch: false,
+    people: repo === 'o/alpha'
+      ? [rankRow('ann-example', { [window]: rank({ merged: 2 + polls }) }), rankRow('bo-example', { [window]: rank({ merged: 1 }) })]
+      : [],
+  });
+  const h = await setup({
+    storage: { peopleWindow: '7d', peopleMode: 'rankings', peopleGroup: true },
+    host: (cmd, args) => (cmd === 'get_people' ? people() : cmd === 'repo_detail' ? perRepo(String(args?.repo), String(args?.window))
+      : cmd === 'person_detail' ? annDetail(String(args?.window)) : undefined),
+  });
+  keydown(h, '4', true);
+  await tick();
+  const caretOf = (key: string) => h.doc.querySelector<HTMLButtonElement>(`#rank-table tr.rank-row[data-group="o/alpha"][data-key="${key}"] .caret`)!;
+  caretOf('ann-example').click();
+  await tick();
+  caretOf('bo-example').focus();
+  const before = hostCalls(h).filter((c) => c.cmd === 'repo_detail').length;
+  const head = () => h.doc.querySelector<HTMLTableRowElement>('#rank-table tr.repo-group[data-group="o/alpha"]')!;
+  assert.equal(head().cells[1]!.textContent, '3');
+  assert.match(head().title, /Co-authored, Active days and PRs reviewed do not add up and are left blank/);
+  polls = 1;
+  h.emit('craft:people', people());
+  assert.deepEqual(groupKeys(h, 'rank-table', 'o/alpha'), ['ann-example', 'bo-example'], 'the earlier answer stays while the host is asked');
+  assert.doesNotMatch(h.doc.getElementById('rank-table')!.textContent!, /loading…/);
+  assert.ok(h.doc.querySelector('#rank-table tr.detail[data-group="o/alpha"] .work-tables'), 'the open detail keeps its tables');
+  assert.equal((h.doc.activeElement as HTMLElement).dataset.focus, 'rank-caret:o/alpha|bo-example', 'the focus stays');
+  assert.ok(hostCalls(h).filter((c) => c.cmd === 'repo_detail').length > before, 'each repo is asked again');
+  await tick();
+  assert.equal(head().cells[1]!.textContent, '4', 'the new answer replaces the earlier one');
+  assert.equal((h.doc.activeElement as HTMLElement).dataset.focus, 'rank-caret:o/alpha|bo-example', 'and the focus is still there');
+});
+
+test('a repo search in Rankings finds the people that repo’s own figures list, co-authors included, and keeps them through a new view', async () => {
+  const view = people();
+  view.rankings.push(rankRow('cy-coauthor', { '7d': rank({ co_authored: 2, active_days: 1 }) }));
+  const h = await setup({
+    storage: { peopleWindow: '7d', peopleMode: 'rankings' },
+    host: (cmd, args) => (cmd === 'get_people' ? view : cmd === 'repo_detail'
+      ? { repo: String(args?.repo), window: String(args?.window), batch: false, people: args?.repo === 'o/beta' ? [rankRow('cy-coauthor', { '7d': rank({ co_authored: 2, active_days: 1 }) })] : [] }
+      : undefined),
+  });
+  keydown(h, '4', true);
+  assert.equal(hostCalls(h).filter((c) => c.cmd === 'repo_detail').length, 0, 'no search, no per-repo request');
+  typeInto(h, peopleSearch(h), 'beta');
+  assert.doesNotMatch(h.doc.getElementById('rank-table')!.textContent!, /Nobody matches/, 'not while the repos are asked');
+  assert.match(h.doc.getElementById('rank-table')!.textContent!, /Looking up each repo’s people…/);
+  assert.equal(h.doc.getElementById('people-matches')!.textContent, '', 'and no count yet');
+  await tick();
+  assert.deepEqual(rankKeys(h), ['cy-coauthor'], 'not in the Work figures, but in beta’s rankings');
+  const count = h.doc.getElementById('people-matches')!.textContent;
+  assert.equal(count, '1 of 4 people');
+  h.emit('craft:people', view);
+  assert.deepEqual(rankKeys(h), ['cy-coauthor'], 'no empty table while the host is asked again');
+  assert.equal(h.doc.getElementById('people-matches')!.textContent, count);
+  await tick();
+  assert.deepEqual(rankKeys(h), ['cy-coauthor']);
 });

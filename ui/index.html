@@ -59,6 +59,9 @@
           <button class="seg" data-pmode="work" role="tab">Work</button>
           <button class="seg" data-pmode="rankings" role="tab">Rankings</button>
         </div>
+        <label class="toggle" title="One section per repo, with that repo’s figures for each person"><input type="checkbox" id="people-group"> Group by repo</label>
+        <input type="search" id="people-search" placeholder="Search people (⌘F)" aria-label="Search people by login, name or repo" spellcheck="false" autocomplete="off">
+        <span class="hint" id="people-matches" role="status"></span>
         <select id="people-window" aria-label="Window for flow and reviews"></select>
         <select id="people-repo" aria-label="Repository"></select>
         <select id="people-rank" aria-label="Ranking"></select>

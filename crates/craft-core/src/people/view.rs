@@ -155,6 +155,11 @@ pub fn assemble(
                 .unwrap_or_default()
         })
         .collect();
+    view.discord = dir
+        .people
+        .iter()
+        .filter_map(|(key, p)| Some((key.clone(), p.discord.clone()?)))
+        .collect();
     let held = |state: PrState| -> u64 {
         caches
             .iter()
@@ -331,6 +336,9 @@ pub struct PeopleView {
     pub co_unlinked: BTreeMap<String, BTreeMap<String, u64>>,
     /// Roster rows without a GitHub login, by name.
     pub unlinked: Vec<String>,
+    /// The roster's Discord name of each person who has one, by canonical
+    /// login. The People search reads it.
+    pub discord: BTreeMap<String, String>,
     pub load: Load,
     /// Each repository's flow, by repository and window.
     pub repos: BTreeMap<String, BTreeMap<String, RepoFlow>>,
@@ -923,10 +931,17 @@ mod tests {
         };
         cache.checked_at = Some(t(19, 23));
         let mut caches = vec![("o/app".to_string(), cache)];
-        let roster = [RosterRow {
-            name: Some("No Login".into()),
-            ..Default::default()
-        }];
+        let roster = [
+            RosterRow {
+                name: Some("No Login".into()),
+                ..Default::default()
+            },
+            RosterRow {
+                github: Some("Ann-Example".into()),
+                discord: Some("ann_d".into()),
+                ..Default::default()
+            },
+        ];
         let (v, _, rk) = assemble(
             &mut caches,
             &PeopleConfig::default(),
@@ -954,6 +969,11 @@ mod tests {
             (1, 1, 10)
         );
         assert_eq!(v.unlinked, ["No Login"]);
+        assert_eq!(
+            v.discord,
+            BTreeMap::from([("ann-example".to_string(), "ann_d".to_string())]),
+            "the roster's Discord name, by canonical login; people without one are left out"
+        );
         let rec = &caches[0].1.records[&2];
         assert_eq!(rec.derived.kind.as_ref().unwrap().value, "docs");
         assert_eq!(rec.derived.area.as_ref().unwrap().value, "docs");

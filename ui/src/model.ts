@@ -488,6 +488,8 @@ export interface PeopleView {
   co_unlinked: Record<string, Record<string, number>>;
   /** Roster rows without a GitHub login, by name. */
   unlinked: string[];
+  /** The roster's Discord name of each person who has one, by canonical login. */
+  discord: Record<string, string>;
   load: Load;
   /** Each repo's flow, by repo and window. */
   repos: Record<string, Record<string, RepoFlow>>;
@@ -860,7 +862,11 @@ export function personValue(f: PersonFigures, key: string): number | string | nu
 
 /** The people with anything in `window` for `repo`, sorted by `sort` (missing values last, ties by login). */
 export function peopleRows(view: PeopleView, window: string, repo: string, sort: Sort): PersonFigures[] {
-  const rows = view.people.map((p) => personFigures(view, p, window, repo)).filter(hasFigures);
+  return sortFigures(view.people.map((p) => personFigures(view, p, window, repo)).filter(hasFigures), sort);
+}
+
+/** `rows` sorted by `sort`, missing values last, ties by login. */
+function sortFigures(rows: PersonFigures[], sort: Sort): PersonFigures[] {
   const sign = sort.dir === 'asc' ? 1 : -1;
   return rows.sort((a, b) => {
     const x = personValue(a, sort.key);
@@ -940,6 +946,58 @@ export function cachedText(view: PeopleView | null | undefined): string {
   ].filter(Boolean).join(' · ');
 }
 
+// ───────────────────────────── search and groups ─────────────────────────────
+
+/** The words of a People search, lowercased; none for an empty search. */
+export const searchWords = (query: string): string[] => query.toLowerCase().split(/\s+/).filter(Boolean);
+
+/** Whether every word is part of one of `fields`, in any letter case. No words match everyone. */
+export function matchesSearch(words: readonly string[], fields: readonly (string | null | undefined)[]): boolean {
+  const hay = fields.flatMap((f) => (f ? [f.toLowerCase()] : []));
+  return words.every((w) => hay.some((h) => h.includes(w)));
+}
+
+/** Who a People search reads: a person row or a ranking row. */
+export interface SearchedPerson { key: string; login: string; name: string | null }
+
+/** What a People search reads for one person: the login, the canonical login, the roster name, the Discord name, and `repos` by full and short name. */
+export function personSearchFields(view: PeopleView, who: SearchedPerson, repos: readonly string[]): string[] {
+  return [who.login, who.key, who.name ?? '', view.discord?.[who.key] ?? '', ...repos.flatMap((r) => [r, r.split('/').pop() ?? r])];
+}
+
+/** Whether a person matches the search `words`; `repos` lists their repos, and is called only when their names leave a word unmatched. */
+export function personMatches(view: PeopleView, who: SearchedPerson, words: readonly string[], repos: () => readonly string[]): boolean {
+  if (matchesSearch(words, personSearchFields(view, who, []))) return true;
+  return matchesSearch(words, personSearchFields(view, who, repos()));
+}
+
+/** "3 of 12 people" for a search; '' without one. */
+export const matchText = (shown: number, total: number, words: readonly string[]): string =>
+  (words.length ? `${formatCount(shown)} of ${formatCount(total)} ${total === 1 ? 'person' : 'people'}` : '');
+
+/** One repo's people in the grouped Work view. */
+export interface PeopleGroup { repo: string; rows: PersonFigures[] }
+
+/** The Work view grouped by repo: for each repo of `repos`, the people with figures there in `window`, with that repo's figures, sorted by `sort`. `keep` picks the people a search shows; repos left without people are dropped. */
+export function peopleGroups(view: PeopleView, window: string, repos: readonly string[], sort: Sort,
+  keep: (p: PersonRow, repo: string) => boolean = () => true): PeopleGroup[] {
+  return repos.flatMap((repo) => {
+    const rows = view.people.filter((p) => keep(p, repo)).map((p) => personFigures(view, p, window, repo)).filter(hasFigures);
+    return rows.length ? [{ repo, rows: sortFigures(rows, sort) }] : [];
+  });
+}
+
+/** The totals of a group's header row, for the columns that add up: open, on others, held, merged, landed elsewhere, closed and reviews given. */
+export function groupTotals(rows: readonly PersonFigures[]): Partial<Record<string, number>> {
+  const sum = (f: (r: PersonFigures) => number) => rows.reduce((n, r) => n + f(r), 0);
+  return {
+    open: sum((r) => r.open), on_others: sum((r) => r.onOthersTotal), held: sum((r) => r.held), merged: sum((r) => r.merged),
+    landed: sum((r) => r.landed), closed: sum((r) => r.closed), reviews: sum((r) => r.reviews),
+  };
+}
+/** The hover text of a grouped Work view's repo header. */
+export const GROUP_TOTALS_TIP = 'Totals of the people listed. On them, To merge, Landed, They answer and First response do not add up and are left blank.';
+
 // ───────────────────────────── rankings ─────────────────────────────
 
 /** The three rankings the selector offers. */
@@ -1014,7 +1072,12 @@ function ranked(r: Rank, mode: RankMode): boolean {
 
 /** The people with figures for ranking `mode` in `window`, sorted by `sort` (missing values last, ties by login). */
 export function rankRows(view: PeopleView, window: string, mode: RankMode, sort: Sort): { row: RankRow; rank: Rank }[] {
-  const rows = (view.rankings ?? []).flatMap((row) => {
+  return rankRowsOf(view.rankings ?? [], window, mode, sort);
+}
+
+/** {@link rankRows} for any list of rows, such as one repo's people from `repo_detail`. */
+export function rankRowsOf(list: readonly RankRow[], window: string, mode: RankMode, sort: Sort): { row: RankRow; rank: Rank }[] {
+  const rows = list.flatMap((row) => {
     const rank = row.windows[window];
     return rank && ranked(rank, mode) ? [{ row, rank }] : [];
   });
@@ -1030,6 +1093,30 @@ export function rankRows(view: PeopleView, window: string, mode: RankMode, sort:
     return a.row.login.toLowerCase() < b.row.login.toLowerCase() ? -1 : 1;
   });
 }
+
+/** The total of ranking column `key` over `rows`, as a group header shows it: lines as "+a −r", a sum otherwise; '' for the person column,
+ * for direct commits nobody has, and for the columns two people can share an item in (co-authored commits, active days, reviewed pull requests). */
+export function rankTotal(rows: readonly { rank: Rank }[], key: string): string {
+  const sum = (f: (r: Rank) => number) => rows.reduce((n, { rank }) => n + f(rank), 0);
+  switch (key) {
+    case 'person':
+    case 'co_authored':
+    case 'active_days':
+    case 'reviewed_prs': return '';
+    case 'lines': return linesText(sum((r) => r.added), sum((r) => r.removed));
+    case 'generated': return linesText(sum((r) => r.gen_added), sum((r) => r.gen_removed));
+    case 'review_lines': return linesText(sum((r) => r.review_added), sum((r) => r.review_removed));
+    case 'direct': return rows.some(({ rank }) => rank.direct !== null) ? formatCount(sum((r) => r.direct ?? 0)) : '';
+    default: return formatCount(sum((r) => {
+      const v = rankValue(NO_ROW, r, key);
+      return typeof v === 'number' ? v : 0;
+    }));
+  }
+}
+/** The hover text of a grouped ranking's repo header. */
+export const RANK_TOTALS_TIP = 'Totals of the people listed. Co-authored, Active days and PRs reviewed do not add up and are left blank.';
+/** A row for {@link rankValue} on columns that read only the figures. */
+const NO_ROW: RankRow = { key: '', login: '', name: null, on_roster: false, maintainer: false, windows: {} };
 
 /** The next sort for a click on ranking column `key`: text columns start ascending, the rest descending. */
 export function nextRankSort(sort: Sort, key: string): Sort {

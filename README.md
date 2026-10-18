@@ -139,6 +139,22 @@ response times cover all time. The repo picker limits every figure to one
 repo. Every column sorts. A name from the team roster (`people.roster`)
 shows next to the login.
 
+The search box in the bar (`⌘F`) filters the work view and Rankings as you
+type, by GitHub login, roster name, the roster's Discord name, and repo.
+Every word has to match. In Rankings, a repo matches the people listed in
+that repo's own figures, co-authors included. The bar shows how many people
+match, as in `3 of 12 people`, and `Esc` clears the search.
+
+**Group by repo**, next to the Work and Rankings buttons, shows one section
+per repo with that repo's people and each person's figures in that repo. A
+section's header row gives its people count and the totals of the columns
+that add up; its caret collapses the section. Sorting applies inside each
+section, and the search keeps a person in a section when the words match them
+or the section's repo. The app remembers the choice and the collapsed
+sections. In Rankings, the sections come from the same per-repo figures as
+the caret on a Repos row, and their header rows leave Co-authored, Active days
+and PRs reviewed blank.
+
 The caret on a person opens one row per repo and the person's detail: open
 work by state, grouped by who it waits on, with the median and longest time in
 state and the five oldest items; the work of others that waits on them; their
@@ -192,10 +208,11 @@ The caret on a person, in Rankings and in the work view, shows where their
 work went in the window: by repository (with their merges, reviews and review
 commits), by area, by type and by directory (two path segments under
 `crates/` and `apps/`, translation catalogs grouped as `translations`). With a
-repo picked, the tables cover that repo alone. Each row gives their merged
-pull requests, their product lines and their share of their own total. Click a
-directory, or press `Enter` or `Space` on it, to list its modules under
-`src/`. Hover an area or a type for the rule that decided it.
+repo picked, and in a repo section of the grouped view, the tables cover that
+repo alone. Each row gives their merged pull requests, their product lines and
+their share of their own total. Click a directory, or press `Enter` or `Space`
+on it, to list its modules under `src/`. Hover an area or a type for the rule
+that decided it.
 
 The caret on a row of the Repos table shows that repo's people for the table's
 window, with their merges, reviews and review commits, and its open work: open
@@ -276,6 +293,9 @@ The app behaves like the Todo app:
   Space. It remembers its position and size in `~/.craft_status_state.toml`.
 - `Esc` hides the window.
 - `⌘1`, `⌘2` and `⌘4` switch to Repos, Fix first and People.
+- In the People tab, `⌘F` moves to the search box. There `Esc` clears the
+  search when there is one, then leaves the search box, and then hides the
+  window.
 
 ## Configuration: `~/.craft_status_config.toml`
 
