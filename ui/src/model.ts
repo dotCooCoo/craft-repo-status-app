@@ -166,16 +166,15 @@ export function getSetting(cfg: object, key: string): unknown {
 export function withSetting<T extends object>(cfg: T, key: string, v: unknown): T {
   const [head, ...rest] = key.split('.');
   const o = cfg as Record<string, unknown>;
+  if (!rest.length) return { ...cfg, [head!]: v };
   const inner = o[head!];
-  return { ...cfg, [head!]: rest.length ? withSetting(inner && typeof inner === 'object' ? inner : {}, rest.join('.'), v) : v };
+  const nested = inner && typeof inner === 'object' ? inner : {};
+  return { ...cfg, [head!]: withSetting(nested, rest.join('.'), v) };
 }
 
 /** `https://github.com/o/r(.git)(/…)` or `o/r` → `o/r`, or null; as `normalize_repo` in config.rs. */
 export function normalizeRepo(s: string): string | null {
-  let t = s.trim();
-  for (const p of ['https://github.com/', 'http://github.com/', 'github.com/']) {
-    if (t.startsWith(p)) { t = t.slice(p.length); break; }
-  }
+  const t = s.trim().replace(/^(?:https?:\/\/)?github\.com\//, '');
   const parts = t.split('/').filter(Boolean);
   if (parts.length < 2) return null;
   const owner = parts[0]!;
@@ -212,7 +211,7 @@ export function settingsProblems(cfg: Config): Record<string, string> {
     out.stale_minutes = 'Enter at least the fetch interval.';
   }
   const accel = cfg.shortcuts.toggle_window.trim();
-  if (accel && accel.split('+').some((k) => !k.trim())) out['shortcuts.toggle_window'] = 'Join the keys with single + signs, such as CmdOrCtrl+Shift+G.';
+  if (accel !== '' && accel.split('+').some((k) => !k.trim())) out['shortcuts.toggle_window'] = 'Join the keys with single + signs, such as CmdOrCtrl+Shift+G.';
   return out;
 }
 
@@ -225,7 +224,9 @@ export function relaunchChanges(before: Config, after: Config): string[] {
 export function tokenSourceNote(token: TokenStatus | null | undefined): string {
   if (!token) return '';
   if (!token.source) return 'The last fetch found no token.';
-  const used = token.source === 'config' ? 'the token saved here' : token.source === 'gh CLI' ? '`gh auth token`' : token.source;
+  let used = token.source;
+  if (token.source === 'config') used = 'the token saved here';
+  else if (token.source === 'gh CLI') used = '`gh auth token`';
   const note = `The last fetch used ${used}${token.rejected ? ', and GitHub rejected it' : ''}.`;
   return token.source.startsWith('$') ? `${note} A token saved here is not used while ${token.source} is set.` : note;
 }

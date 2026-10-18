@@ -297,16 +297,33 @@ impl Config {
         let mut written = saved.clone();
         written.repos = spell(&saved.repos);
         let mut out = written.update_text(&text)?;
-        // Leave out the values the file already reads as, unless what is
-        // left then reads back as other values.
+        // Leave out the values the file already reads as, and put back each
+        // one whose absence makes the file read as another value.
         if let Ok(mut read) = Config::parse(&text) {
             read.repos = spell(&read.repos);
-            let mut new: DocumentMut = toml::to_string(&written)?.parse()?;
+            let full: DocumentMut = toml::to_string(&written)?.parse()?;
+            let want: DocumentMut = toml::to_string(&saved)?.parse()?;
             let old: DocumentMut = toml::to_string(&read)?.parse()?;
+            let mut new = full.clone();
             prune(new.as_table_mut(), old.as_table());
-            let kept = write_into(&text, new.as_table())?;
-            if Config::parse(&kept).is_ok_and(|c| c == saved) {
-                out = kept;
+            loop {
+                let kept = write_into(&text, new.as_table())?;
+                let Ok(back) = Config::parse(&kept) else {
+                    break;
+                };
+                if back == saved {
+                    out = kept;
+                    break;
+                }
+                let back: DocumentMut = toml::to_string(&back)?.parse()?;
+                if !restore(
+                    new.as_table_mut(),
+                    full.as_table(),
+                    back.as_table(),
+                    want.as_table(),
+                ) {
+                    break;
+                }
             }
         }
         if Config::parse(&out)? != saved {
@@ -375,6 +392,47 @@ fn prune(new: &mut dyn TableLike, old: &dyn TableLike) {
             new.remove(&key);
         }
     }
+}
+
+/// Puts into `new` the value from `full` at each place where `back` differs
+/// from `want`, and returns whether `new` changed.
+fn restore(
+    new: &mut dyn TableLike,
+    full: &dyn TableLike,
+    back: &dyn TableLike,
+    want: &dyn TableLike,
+) -> bool {
+    let mut changed = false;
+    for (key, item) in want.iter() {
+        let was = back.get(key);
+        if was.is_some_and(|b| same_item(b, item)) {
+            continue;
+        }
+        let Some(from) = full.get(key) else {
+            continue;
+        };
+        match (
+            item.as_table_like(),
+            was.and_then(Item::as_table_like),
+            from.as_table_like(),
+        ) {
+            (Some(item), Some(was), Some(from)) => {
+                if new.get(key).is_none() {
+                    new.insert(key, Item::Table(Table::new()));
+                }
+                if let Some(table) = new.get_mut(key).and_then(Item::as_table_like_mut) {
+                    changed |= restore(table, from, was, item);
+                }
+            }
+            _ => {
+                if !new.get(key).is_some_and(|n| same_item(n, from)) {
+                    new.insert(key, from.clone());
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
 }
 
 /// Writes `src`'s values into `dst`, keeping `dst`'s formatting; see
@@ -750,14 +808,21 @@ mod tests {
             text.replace("opacity = 0.1\n", "opacity = 0.1\nalways_on_top = true\n")
         );
         // Here the file's stale threshold would read as the new interval, so
-        // the save writes it too.
-        let stale = temp_config("forms-stale", "poll_minutes = 5\nstale_minutes = 2\n");
+        // the save writes it too, and leaves the file's other values as they are.
+        let stale = temp_config(
+            "forms-stale",
+            "poll_minutes = 5\nstale_minutes = 2\n\n[window]\nopacity = 0.1\n",
+        );
         let mut c = Config::load_from(&stale).unwrap();
         assert_eq!((c.poll_minutes, c.stale_minutes), (5.0, 5.0));
         c.poll_minutes = 3.0;
         c.save_to(&stale).unwrap();
         let back = Config::load_from(&stale).unwrap();
         assert_eq!((back.poll_minutes, back.stale_minutes), (3.0, 5.0));
+        assert_eq!(
+            std::fs::read_to_string(&stale).unwrap(),
+            "poll_minutes = 3.0\nstale_minutes = 5.0\n\n[window]\nopacity = 0.1\n"
+        );
         for p in [path, stale] {
             std::fs::remove_dir_all(p.parent().unwrap()).ok();
         }

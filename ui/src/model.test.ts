@@ -244,6 +244,10 @@ test('repos normalize as config.rs does', () => {
   assert.equal(normalizeRepo('github.com/a/b/pulls'), 'a/b');
   assert.equal(normalizeRepo(' http://github.com/a/b '), 'a/b');
   for (const bad of ['nonsense', 'x/y z', 'a/.git', '', 'a/b?c']) assert.equal(normalizeRepo(bad), null, bad);
+  assert.equal(normalizeRepo('http://github.com/o/r'), 'o/r');
+  assert.equal(normalizeRepo('http://github.com/o/r.git/issues'), 'o/r');
+  assert.equal(normalizeRepo('https://github.com/github.com/o/r'), 'github.com/o', 'one prefix is removed');
+  for (const bad of ['HTTP://github.com/o/r', 'ftp://github.com/o/r', 'http://github.com']) assert.equal(normalizeRepo(bad), null, bad);
   assert.equal(repoProblem('o/c', ['o/a']), null);
   assert.match(repoProblem('O/A', ['https://github.com/o/a']) ?? '', /already listed/);
   assert.match(repoProblem('o', []) ?? '', /owner\/name/);

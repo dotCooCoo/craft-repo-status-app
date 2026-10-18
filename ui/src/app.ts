@@ -531,11 +531,16 @@ export function start(api: Api): () => void {
       extra.push(el('span', { class: 'help', id: 'settings-token-source' }, tokenSourceNote(state.snap?.token)));
     } else {
       const numeric = f.kind === 'number';
+      // An empty number field is NaN, which settingsProblems reports.
+      const typed = (): number | string => {
+        if (!numeric) return input.value;
+        return input.value.trim() === '' ? Number.NaN : Number(input.value);
+      };
       input = el('input', {
         type: numeric ? 'number' : 'text', id, min: f.min, max: f.max, step: f.step, spellcheck: 'false', autocomplete: 'off',
-        oninput: () => editSetting(f.key, numeric ? (input.value.trim() === '' ? NaN : Number(input.value)) : input.value),
+        oninput: () => editSetting(f.key, typed()),
       });
-      input.value = String(v ?? '');
+      input.value = typeof v === 'number' || typeof v === 'string' ? String(v) : '';
     }
     return el('div', { class: 'setting' },
       el('label', { for: id }, f.label,
@@ -658,7 +663,7 @@ export function start(api: Api): () => void {
   $('resize').addEventListener('mousedown', (e) => { e.preventDefault(); api.startResize(); });
   document.addEventListener('keydown', (e) => {
     const mod = e.metaKey || e.ctrlKey;
-    if (e.key === 'Escape') { if (state.view === 'settings') closeSettings(); else api.invoke('hide_window'); }
+    if (e.key === 'Escape') { if (state.view === 'settings') closeSettings(); else void api.invoke('hide_window'); }
     else if (mod && e.key === ',') { e.preventDefault(); void openSettings(); }
     else if (mod && e.key.toLowerCase() === 'r') { e.preventDefault(); api.invoke('refresh_now'); }
     else if (mod && e.key === '1') setView('repos');
