@@ -61,6 +61,7 @@ fn main() {
     let mut snap = Snapshot {
         poll_secs: cfg.poll_secs(),
         stale_after_secs: cfg.stale_secs(),
+        parity_warn_days: cfg.parity_review_warn_days,
         ..Default::default()
     };
     println!(

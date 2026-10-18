@@ -193,6 +193,9 @@ pub struct Snapshot {
     pub next_refresh_at: Option<Time>,
     pub poll_secs: i64,
     pub stale_after_secs: i64,
+    /// `parity_review_warn_days` from the config: the Parity tab marks
+    /// documents last reviewed longer ago than this.
+    pub parity_warn_days: u32,
     pub rate_limit_remaining: Option<u64>,
     /// Problems that aren't about one repository (no token, rate limited…).
     pub error: Option<String>,

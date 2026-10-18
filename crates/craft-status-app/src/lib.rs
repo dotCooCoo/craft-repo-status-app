@@ -212,6 +212,7 @@ fn reload_config_if_changed(app: &AppHandle) {
                 snap.sync_repos(&cfg.repos);
                 snap.poll_secs = cfg.poll_secs();
                 snap.stale_after_secs = cfg.stale_secs();
+                snap.parity_warn_days = cfg.parity_review_warn_days;
                 if snap
                     .error
                     .as_deref()
@@ -255,14 +256,15 @@ enum ParityStep {
 }
 
 /// The [`ParityStep`] for a repo whose parity documents are `files` (blob
-/// ids by path), holding `held`, after a fetch that left `left` GraphQL
-/// points.
+/// ids by path) at commit `head`, holding `held`, after a fetch that left
+/// `left` GraphQL points.
 fn parity_step(
     files: &std::collections::BTreeMap<String, String>,
+    head: Option<&str>,
     held: Option<&craft_core::Parity>,
     left: Option<u64>,
 ) -> ParityStep {
-    if held.is_some_and(|p| p.is_current(files)) {
+    if held.is_some_and(|p| p.is_current(files, head)) {
         ParityStep::Keep
     } else if files.is_empty() || left.is_none_or(|r| r >= OPTIONAL_FLOOR) {
         ParityStep::Read
@@ -342,7 +344,8 @@ fn fetch_into_snapshot(app: &AppHandle, cfg: &Config, repo: &str) -> Result<(), 
                     .iter()
                     .find(|e| e.repo == repo)
                     .and_then(|e| e.parity.as_ref());
-                parity_step(&stats.parity_oids, held, budget.graphql_remaining)
+                let head = stats.head_oid.as_deref();
+                parity_step(&stats.parity_oids, head, held, budget.graphql_remaining)
             };
             (step == ParityStep::Read)
                 .then(|| gh.parity(repo, stats.head_oid.as_deref(), &stats.parity_oids))
@@ -454,6 +457,7 @@ fn step(app: &AppHandle, pacing: &mut Pacing) {
     let due = {
         let mut snap = state.snapshot.lock().unwrap();
         snap.sync_repos(&cfg.repos);
+        snap.parity_warn_days = cfg.parity_review_warn_days;
         snap.poll_secs = cfg.poll_secs();
         snap.stale_after_secs = cfg.stale_secs();
         let paused = pacing.not_before.is_some_and(|t| now < t);
@@ -849,6 +853,7 @@ pub fn run() {
     snapshot.sync_repos(&config.repos);
     snapshot.poll_secs = config.poll_secs();
     snapshot.stale_after_secs = config.stale_secs();
+    snapshot.parity_warn_days = config.parity_review_warn_days;
 
     let (tx, rx) = mpsc::channel();
     let state = AppState {
@@ -980,26 +985,41 @@ mod tests {
         ]);
         let plenty = Some(OPTIONAL_FLOOR);
         let low = Some(OPTIONAL_FLOOR - 1);
-        assert_eq!(parity_step(&docs, Some(&held), plenty), ParityStep::Keep);
-        assert_eq!(parity_step(&docs, Some(&held), low), ParityStep::Keep);
+        let head = Some("h1");
+        let step = |files, held, left| parity_step(files, head, held, left);
+        assert_eq!(step(&docs, Some(&held), plenty), ParityStep::Keep);
+        assert_eq!(step(&docs, Some(&held), low), ParityStep::Keep);
         let changed = files(&[(ROADMAP, "a2"), (PARITY_DOC, "b1")]);
-        assert_eq!(parity_step(&changed, Some(&held), plenty), ParityStep::Read);
+        assert_eq!(step(&changed, Some(&held), plenty), ParityStep::Read);
         assert_eq!(
-            parity_step(&changed, Some(&held), None),
+            step(&changed, Some(&held), None),
             ParityStep::Read,
             "GitHub sent no count"
         );
-        assert_eq!(parity_step(&changed, Some(&held), low), ParityStep::Wait);
-        assert_eq!(parity_step(&docs, None, plenty), ParityStep::Read);
-        assert_eq!(parity_step(&docs, None, Some(0)), ParityStep::Wait);
+        assert_eq!(step(&changed, Some(&held), low), ParityStep::Wait);
+        assert_eq!(step(&docs, None, plenty), ParityStep::Read);
+        assert_eq!(step(&docs, None, Some(0)), ParityStep::Wait);
         // Without documents there is nothing to download, whatever the budget.
         let none = BTreeMap::new();
-        assert_eq!(parity_step(&none, None, Some(0)), ParityStep::Read);
+        assert_eq!(step(&none, None, Some(0)), ParityStep::Read);
+        let empty = read(&[]);
+        assert_eq!(step(&none, Some(&empty), Some(0)), ParityStep::Keep);
+        assert_eq!(step(&none, Some(&held), Some(0)), ParityStep::Read);
+        // A report whose breadth row links to a document outside `docs` is
+        // read again at a new commit.
+        let mut linked = read(&[Input {
+            path: ROADMAP,
+            oid: "a1",
+            text: "## Headline numbers\n| | Value | Kind |\n|---|---|---|\n\
+                   | Feature breadth | 50% | [menus](docs/menus.md) |\n",
+        }]);
+        linked.commit = head.map(str::to_string);
+        let roadmap = files(&[(ROADMAP, "a1")]);
+        assert_eq!(step(&roadmap, Some(&linked), plenty), ParityStep::Keep);
         assert_eq!(
-            parity_step(&none, Some(&read(&[])), Some(0)),
-            ParityStep::Keep
+            parity_step(&roadmap, Some("h2"), Some(&linked), plenty),
+            ParityStep::Read
         );
-        assert_eq!(parity_step(&none, Some(&held), Some(0)), ParityStep::Read);
     }
 
     #[test]

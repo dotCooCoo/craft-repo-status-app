@@ -8,7 +8,8 @@ use regex::Regex;
 use super::md::{self, plain, Doc, Table};
 use super::value::{self, fraction};
 use super::{
-    Basis, Cell, DocFile, Figure, Hours, Note, Parity, Src, Stage, StageStep, README, ROADMAP,
+    Basis, Cell, Checklist, DocFile, Figure, Hours, Note, Parity, Src, Stage, StageStep, GAPS,
+    README, ROADMAP,
 };
 
 static STAGE: LazyLock<Regex> = LazyLock::new(|| {
@@ -169,6 +170,7 @@ struct Row<'a> {
     qualifier: String,
     value: &'a str,
     kind: String,
+    kind_raw: &'a str,
 }
 
 fn rows<'a>(t: &'a Table, value_col: usize) -> Vec<Row<'a>> {
@@ -188,6 +190,9 @@ fn rows<'a>(t: &'a Table, value_col: usize) -> Vec<Row<'a>> {
                     .and_then(|k| r.cells.get(k))
                     .map(|c| c.text.clone())
                     .unwrap_or_default(),
+                kind_raw: kind
+                    .and_then(|k| r.cells.get(k))
+                    .map_or("", |c| c.raw.as_str()),
             }
         })
         .collect()
@@ -337,6 +342,16 @@ pub fn headline(out: &mut Parity, rm: Option<&Doc>, tap: Option<&Doc>) {
                 .map(|(_, r)| r.figure(path, None, None))
                 .collect();
             let b = breadth[i];
+            // Each linked document once, though several sections are linked.
+            out.breadth_links = Vec::new();
+            for p in md::links(b.kind_raw)
+                .into_iter()
+                .filter_map(|(_, url)| super::dims::resolve(path, &url))
+            {
+                if p != path && !out.breadth_links.contains(&p) {
+                    out.breadth_links.push(p);
+                }
+            }
             let menu = format!("{} {}", b.label, b.kind).to_lowercase();
             if menu.contains("menu") {
                 out.menu_hint = fraction(&plain(b.value)).or_else(|| fraction(&b.kind));
@@ -626,6 +641,71 @@ pub fn date_notes(out: &mut Parity, docs: &[&Doc]) {
     }
 }
 
+/// Notes comparing one source with another: the stage line's hours with
+/// To beta, the headline menu figure with the checklist total, and the beta
+/// gaps' hours with To beta.
+pub fn cross_checks(out: &mut Parity) {
+    if let (Some(stage), Some(to_beta)) = (out.stage.get(), out.to_beta.get()) {
+        if let Some(h) = stage
+            .steps
+            .iter()
+            .find(|s| s.stage == "beta")
+            .and_then(|s| s.hours.as_ref())
+        {
+            if (h.lo, h.hi) != (to_beta.lo, to_beta.hi) {
+                out.notes.push(Note::info(
+                    format!(
+                        "stage line says {}–{} h to beta; the headline says {}–{} h",
+                        h.lo, h.hi, to_beta.lo, to_beta.hi
+                    ),
+                    out.stage.src().cloned().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    let menu = match &out.menu_breadth {
+        Figure::Ok {
+            text, path, line, ..
+        } => fraction(text).map(|f| (f, Src::new(path, *line))),
+        _ => None,
+    }
+    .or_else(|| {
+        let src = match &out.breadth {
+            Figure::Ok { path, line, .. } => Src::new(path, *line),
+            _ => Src::default(),
+        };
+        out.menu_hint.map(|f| (f, src))
+    });
+    if let Some((menu, src)) = menu {
+        for c in &out.checklists {
+            if let Checklist::Presence { total, path, .. } = c {
+                if let Some(t) = total.get() {
+                    if (t.done, t.total) != (menu.done, menu.total) {
+                        out.notes.push(Note::info(
+                            format!(
+                                "headline menu figure {}/{} differs from {path}'s {}/{}",
+                                menu.done, menu.total, t.done, t.total
+                            ),
+                            src.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let (Some(beta), Some(to_beta)) = (&out.gap_totals.beta, out.to_beta.get()) {
+        if (beta.lo, beta.hi) != (to_beta.lo, to_beta.hi) {
+            out.notes.push(Note::info(
+                format!(
+                    "Σ beta gaps {}–{} h; the headline says {}–{} h to beta",
+                    beta.lo, beta.hi, to_beta.lo, to_beta.hi
+                ),
+                Src::new(GAPS, 1),
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{read, Input};
@@ -826,6 +906,14 @@ mod tests {
             ok(&rm(md).ready).6,
             Some("Feature depth row (no Ready for real work row)")
         );
+    }
+
+    #[test]
+    fn breadth_links_name_each_document_once() {
+        let md = "## Headline numbers\n\n| | Value | Kind |\n|---|---|---|\n\
+                  | Feature breadth | 60% | measured: [menus](docs/menus.md#file) and [tools](docs/menus.md#tools), \
+                  [this](#headline-numbers), [ui](docs/ui.md) |\n";
+        assert_eq!(rm(md).breadth_links, ["docs/menus.md", "docs/ui.md"]);
     }
 
     #[test]
