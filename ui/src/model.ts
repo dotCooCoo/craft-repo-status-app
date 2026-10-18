@@ -338,6 +338,45 @@ export function compact(n: number | null | undefined): string {
   return `${(n / 1e6).toFixed(1)}M`;
 }
 
+/** A count with thousands separators: 1,234. */
+export const formatNum = (n: Value | undefined): string => Number(n ?? 0).toLocaleString('en-US');
+
+/**
+ * The text a table cell shows for a column, with times aged to `now`: counts
+ * with separators, urgency rounded, `~` before an estimated lag, `PRE` after a
+ * pre-release build, and '—' where there is no data.
+ */
+export function displayValue(entry: RepoEntry, key: string, window: string, now: number): string {
+  const v = value(entry, key, window);
+  const s = entry.stats;
+  const col = COLUMN[key];
+  if (key === 'name') return String(v);
+  if (col?.kind === 'age') return v ? ago(String(v), now) : '—';
+  if (!s) return entry.inaccessible ? '' : '—';
+  switch (key) {
+    case 'urgency': return String(Math.round(Number(v)));
+    case 'commits_since_build': return s.since_build ? `${s.since_build.basis === 'exact' ? '' : '~'}${formatNum(v)}` : '—';
+    case 'latest_build': return v ? `${v}${s.latest_build_prerelease ? ' PRE' : ''}` : '—';
+  }
+  if (col?.recent) return v === null ? '—' : formatNum(v);
+  if (col?.kind === 'date') return v ? ago(String(v), now) : '—';
+  return formatNum(v);
+}
+
+/**
+ * The keys of the columns whose shown text differs between two versions of a
+ * repo's entry. Both are read at the same `now`, so a relative time that has
+ * only aged compares equal. It returns an empty list when either version has
+ * no stats. `age` columns (Fetched) are left out, and so are the
+ * recent-activity columns when `prev` has no activity for `window`.
+ */
+export function changedCells(prev: RepoEntry | undefined, next: RepoEntry, window: string, now: number): string[] {
+  if (!prev?.stats || !next.stats) return [];
+  const unread = !prev.stats.recent?.[window];
+  return COLUMNS.filter((c) => c.kind !== 'age' && !(c.recent && unread)
+    && displayValue(prev, c.key, window, now) !== displayValue(next, c.key, window, now)).map((c) => c.key);
+}
+
 /** Column totals for the footer row (counts only; dates and versions blank). */
 export function totals(entries: readonly RepoEntry[], window: string = DEFAULT_WINDOW): Record<string, number> {
   const out: Record<string, number> = {};
