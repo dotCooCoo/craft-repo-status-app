@@ -225,3 +225,13 @@ td.empty { text-align: center; position: static; white-space: normal; }
 #tbody > tr.repo-detail:hover > td { background-color: transparent; background-image: none; }
 #tbody > tr.repo-detail:hover > td::before { content: none; }
 .repo .caret { margin-right: 2px; }
+
+/* ───── my prs ───── */
+#mine-view { display: flex; flex-direction: column; overflow: hidden; }
+.wstate.tone-me { color: var(--bad); background: color-mix(in srgb, var(--bad) 13%, transparent); }
+.wstate.tone-ci { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.wstate.tone-ready { color: var(--good); background: color-mix(in srgb, var(--good) 14%, transparent); }
+#mine-table td.text { text-align: left; }
+#mine-table th:nth-child(3), #mine-table th:nth-child(7) { text-align: left; }
+.mine-title { display: inline-block; max-width: 420px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+.flag-note { margin-left: 4px; }

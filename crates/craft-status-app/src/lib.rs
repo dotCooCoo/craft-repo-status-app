@@ -708,8 +708,42 @@ impl PeopleWork {
 struct PeopleRuns {
     /// When the last job started.
     last_start: Option<DateTime<Utc>>,
-    /// The token user's login, as the last sweep read it.
-    viewer: Option<String>,
+    /// The token user's login.
+    viewer: Viewer,
+}
+
+/// The login of the user a GitHub token belongs to, kept while the token
+/// stays the same.
+#[derive(Default)]
+struct Viewer {
+    /// The token the login belongs to.
+    token: String,
+    /// The login: read with one query for the token, then as each sweep
+    /// reads it again; `None` until a query answered.
+    login: Option<String>,
+}
+
+impl Viewer {
+    /// The login for `token`. A new token drops the kept login, and with no
+    /// login kept, `ask` reads it; a failed `ask` is logged and asked again
+    /// by the next call.
+    fn for_token(
+        &mut self,
+        token: &str,
+        ask: impl FnOnce() -> Result<String, GhError>,
+    ) -> Option<&str> {
+        if self.token != token {
+            self.token = token.to_string();
+            self.login = None;
+        }
+        if self.login.is_none() {
+            match ask() {
+                Ok(login) => self.login = Some(login),
+                Err(e) => eprintln!("people: the token's login: {e}"),
+            }
+        }
+        self.login.as_deref()
+    }
 }
 
 /// Starts the People thread, which shows the records on disk
@@ -721,7 +755,7 @@ fn spawn_people(app: AppHandle) {
         .spawn(move || {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap().clone();
-            load_people(&app, &cfg);
+            load_people(&app, &cfg, None);
             state.people_work.submit(PeopleJob { cfg, fetch: true });
             let mut runs = PeopleRuns::default();
             loop {
@@ -729,7 +763,7 @@ fn spawn_people(app: AppHandle) {
                 if job.fetch {
                     run_people(&app, &job, &mut runs);
                 } else {
-                    load_people(&app, &job.cfg);
+                    load_people(&app, &job.cfg, runs.viewer.login.as_deref());
                 }
             }
         })
@@ -750,9 +784,12 @@ fn run_people(app: &AppHandle, job: &PeopleJob, runs: &mut PeopleRuns) {
         .map_or(job.cfg.poll_secs(), |t| (now - t).num_seconds())
         .max(REPO_GAP);
     runs.last_start = Some(now);
-    match resolve_token(&job.cfg.github_token).and_then(|t| GitHub::new(t.value)) {
-        Ok(gh) => {
+    let client = resolve_token(&job.cfg.github_token)
+        .and_then(|t| Ok((GitHub::new(t.value.clone())?, t.value)));
+    match client {
+        Ok((gh, token)) => {
             let gh = gh.in_background(state.gate.clone());
+            runs.viewer.for_token(&token, || gh.viewer_login());
             update_people(
                 app,
                 &gh,
@@ -760,7 +797,7 @@ fn run_people(app: &AppHandle, job: &PeopleJob, runs: &mut PeopleRuns) {
                 cache.dir(),
                 now,
                 interval,
-                &mut runs.viewer,
+                &mut runs.viewer.login,
             );
         }
         Err(e) => eprintln!("people: {e}"),
@@ -820,7 +857,7 @@ fn update_people(
         } = event
         {
             eprintln!("people: {} changed records", stage.label());
-            publish_people(app, caches, cfg, &kept.rows, dir, now);
+            publish_people(app, caches, cfg, &kept.rows, dir, now, viewer.as_deref());
         }
     };
     let (report, mut caches) = gh.update_prs(&PrInput {
@@ -845,7 +882,15 @@ fn update_people(
     if let Some(e) = &roster.error {
         eprintln!("people: {e}");
     }
-    let people = publish_people(app, &mut caches, cfg, &roster.rows, dir, now);
+    let people = publish_people(
+        app,
+        &mut caches,
+        cfg,
+        &roster.rows,
+        dir,
+        now,
+        viewer.as_deref(),
+    );
     let held: Vec<(&str, &PrCache)> = caches.iter().map(|(r, c)| (r.as_str(), c)).collect();
     let events = Ledger::build(&held).events.len();
     eprintln!(
@@ -875,7 +920,8 @@ fn update_people(
 /// [`craft_core::people::view::assemble`]), with each repo's latest build
 /// from the snapshot and its commits outside pull requests from the
 /// activity kept in `dir` ([`direct_of`]), keeps both and sends the view to
-/// the window. Returns the directory of people.
+/// the window. The view carries `viewer`, the token user's login, for the
+/// My PRs tab. Returns the directory of people.
 fn publish_people(
     app: &AppHandle,
     caches: &mut [(String, PrCache)],
@@ -883,6 +929,7 @@ fn publish_people(
     roster: &[RosterRow],
     dir: &Path,
     now: DateTime<Utc>,
+    viewer: Option<&str>,
 ) -> Directory {
     let state = app.state::<AppState>();
     let builds: HashMap<String, DateTime<Utc>> = {
@@ -906,7 +953,7 @@ fn publish_people(
             )
         })
         .collect();
-    let (view, people, rankings) = assemble(
+    let (mut view, people, rankings) = assemble(
         caches,
         &cfg.people,
         roster,
@@ -914,6 +961,7 @@ fn publish_people(
         &direct,
         now,
     );
+    view.viewer = viewer.map(str::to_string);
     let view = Arc::new(view);
     *state.people.lock().unwrap() = Some(view.clone());
     *state.rankings.lock().unwrap() = Some(Arc::new(rankings));
@@ -937,8 +985,9 @@ fn direct_of(raw: &RawActivity, cache: &PrCache) -> Direct {
 /// before the first job updates the records, and after a change to the
 /// config file. With no records it sends nothing until a view has been
 /// sent. The roster comes from its kept copy or file, without a download
-/// (see [`roster::load_kept`]).
-fn load_people(app: &AppHandle, cfg: &Config) {
+/// (see [`roster::load_kept`]). `viewer` is the token user's login, as the
+/// last job read it.
+fn load_people(app: &AppHandle, cfg: &Config, viewer: Option<&str>) {
     let state = app.state::<AppState>();
     let Some(cache) = &state.cache else { return };
     let dir = cache.dir();
@@ -953,7 +1002,7 @@ fn load_people(app: &AppHandle, cfg: &Config) {
     }
     let now = Utc::now();
     let roster = roster::load_kept(&cfg.people.roster, dir, now);
-    publish_people(app, &mut caches, cfg, &roster.rows, dir, now);
+    publish_people(app, &mut caches, cfg, &roster.rows, dir, now, viewer);
 }
 
 // ───────────────────────────── window & tray ─────────────────────────────
@@ -1438,6 +1487,35 @@ mod tests {
         assert_eq!((next.cfg.poll_minutes, next.fetch), (5.0, true));
         work.submit(job(6.0, false));
         assert!(!work.take().fetch, "only the view is worked out again");
+    }
+
+    #[test]
+    fn the_token_users_login_is_read_once_per_token() {
+        let asked = std::cell::Cell::new(0);
+        let ask = |answer: Result<&str, GhError>| {
+            asked.set(asked.get() + 1);
+            answer.map(str::to_string)
+        };
+        let mut v = Viewer::default();
+        assert_eq!(
+            v.for_token("t1", || ask(Ok("Ann-Example"))),
+            Some("Ann-Example")
+        );
+        assert_eq!(v.for_token("t1", || ask(Ok("other"))), Some("Ann-Example"));
+        assert_eq!(asked.get(), 1, "kept while the token stays the same");
+        // The sweep read it again.
+        v.login = Some("ann-example".into());
+        assert_eq!(v.for_token("t1", || ask(Ok("other"))), Some("ann-example"));
+        assert_eq!(
+            v.for_token("t2", || ask(Err(GhError::Unauthorized))),
+            None,
+            "a new token drops the old login"
+        );
+        assert_eq!(
+            v.for_token("t2", || ask(Ok("Bo-Example"))),
+            Some("Bo-Example")
+        );
+        assert_eq!(asked.get(), 3, "a failed query is asked again");
     }
 
     #[test]

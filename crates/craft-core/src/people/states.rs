@@ -103,6 +103,8 @@ pub struct Request {
     pub at: Option<Time>,
     pub by: String,
     pub subtype: String,
+    /// The comment or review, or the pull request when GitHub gave no link.
+    pub url: String,
     pub answered: Option<Time>,
     /// The maintainer approved the pull request later, so it no longer
     /// waits for an answer.
@@ -965,6 +967,7 @@ pub fn timings(r: &PrRecord, ctx: &Ctx) -> Timings {
             at: Some(q.at()),
             by: q.said.who.clone(),
             subtype: q.subtype.to_string(),
+            url: q.said.url.clone(),
             answered: q.answered,
             resolved: q.resolved,
         })

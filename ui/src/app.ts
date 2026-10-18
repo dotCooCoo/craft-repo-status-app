@@ -16,6 +16,8 @@ import type {
   DetailRow, Item, PeopleView, PersonDetail, PersonFigures, PersonRow, Rank, RankColumn, RankMode, RankRow, RepoPeople,
   StateTime, WorkState,
 } from './model.ts';
+import { MINE_COLUMNS, heldTip, mineRows, mineValue, myLogin, nextMineSort, replyTip, waitsText } from './model.ts';
+import type { MineRow } from './model.ts';
 
 /** What the UI needs from the host: Tauri commands and events, window chrome. */
 export interface Api {
@@ -24,7 +26,7 @@ export interface Api {
   startResize(): void;
 }
 
-type View = 'repos' | 'urgent' | 'people';
+type View = 'repos' | 'urgent' | 'people' | 'mine';
 
 interface State {
   snap: Snapshot | null;
@@ -53,10 +55,13 @@ interface State {
   dirOpen: Set<string>;
   /** The repos whose caret is open in the Repos table. */
   repoOpen: Set<string>;
+  mineSort: Sort;
+  /** My PRs shows only those whose blocker is on you or that wait for your reply. */
+  mineNeedsOnly: boolean;
 }
 
 /** The view a tab button, a shortcut or the saved view names; the Repos table for anything else. */
-const viewOf = (v: string | null | undefined): View => (v === 'urgent' || v === 'people' ? v : 'repos');
+const viewOf = (v: string | null | undefined): View => (v === 'urgent' || v === 'people' || v === 'mine' ? v : 'repos');
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
   const n = document.getElementById(id);
@@ -132,6 +137,8 @@ export function start(api: Api): () => void {
     rankOpen: new Set(),
     dirOpen: new Set(),
     repoOpen: new Set(),
+    mineSort: load<Sort>('mineSort', { key: 'blocker', dir: 'asc' }),
+    mineNeedsOnly: load('mineNeedsOnly', false),
   };
 
   function openUrl(url: string, ev?: Event): void {
@@ -855,6 +862,115 @@ export function start(api: Api): () => void {
     $('people-count').title = `${held} open pull requests held for the owner`;
   }
 
+  // ───────────────────────────── my prs ─────────────────────────────
+  // My PRs lists one login's open pull requests in the configured repos from
+  // the People view's items. The tab is drawn again for a new People view,
+  // the user's own changes, a changed repo list and when it is shown.
+
+  /** Set when My PRs has to be drawn again at the next render. */
+  let mineRedraw = true;
+  /** The repos My PRs was last drawn for. */
+  let mineDrawnFor: string | null = null;
+
+  /** The rows My PRs shows, for the badge and the table. */
+  function mine(repos: readonly string[], needsOnly: boolean): MineRow[] {
+    const login = myLogin(state.people);
+    if (!login || !state.people) return [];
+    return mineRows(state.people, repos, login, state.mineSort, Date.now(), needsOnly);
+  }
+
+  function mineCell(key: string, r: MineRow, login: string, now: number): Node {
+    const i = r.item;
+    switch (key) {
+      case 'repo': {
+        const entry = state.snap?.repos.find((e) => e.repo.toLowerCase() === i.repo.toLowerCase());
+        return el('span', { class: 'person' }, appIcon(entry ?? { repo: i.repo }), ' ', shortName(i.repo));
+      }
+      case 'number': return link(`#${i.number}`, i.url);
+      case 'title': return el('span', { class: 'mine-title', title: i.title }, i.title);
+      case 'blocker': {
+        const url = i.work.evidence?.url;
+        return el('span', {},
+          el('span', {
+            class: classes('wstate', 'blocker', `tone-${r.blocker.tone}`, i.work.guess && 'guess', r.blocker.tone === 'unread' && 'unread'),
+            title: stateTip(i.work),
+            dataset: url ? { url } : {},
+            onclick: url ? (e: Event) => openUrl(url, e) : null,
+          }, r.blocker.label, i.work.low ? el('span', { class: 'q', 'aria-label': 'low confidence' }, '?') : null),
+          i.work.flags.includes('conflict')
+            ? el('span', { class: 'muted small flag-note', title: 'Conflicts with main; maintainers of this repo rebase contributors’ branches themselves.' }, 'conflict')
+            : null);
+      }
+      case 'reply': return r.reply
+        ? el('span', { class: 'wstate tone-me', title: replyTip(r.reply, now), dataset: { url: r.reply.url || i.url }, onclick: (e: Event) => openUrl(r.reply!.url || i.url, e) }, 'Reply needed')
+        : el('span', { class: 'zero' }, '');
+      case 'held': return r.held ? el('span', { class: 'wstate tone-them', title: heldTip(i, now) }, 'Held') : el('span', { class: 'zero' }, '');
+      case 'waits': return el('span', {}, waitsText(i, login));
+      case 'in_state': return el('span', { title: i.work.since ? localTime(i.work.since) : 'Time in state unknown' }, durationText(mineValue(r, 'in_state', login, now) as number | null));
+      case 'age': return el('span', { title: localTime(i.created_at) }, ago(i.created_at, now));
+      default: return document.createTextNode('');
+    }
+  }
+
+  function renderMine(snap: Snapshot): void {
+    const repos = snap.repos.map((r) => r.repo);
+    $<HTMLInputElement>('mine-needs').checked = state.mineNeedsOnly;
+    const v = state.people;
+    const login = myLogin(v);
+    $('mine-who').textContent = login
+      ? `Open pull requests by ${login} in the ${repos.length} configured repos${v?.my_login ? '' : ' (the token’s user; set people.my_login in the config to list another login)'}`
+      : '';
+    const main = $('mine-main');
+    if (!v) {
+      main.replaceChildren(el('p', { class: 'empty' }, NO_RECORDS));
+      return;
+    }
+    if (!login) {
+      main.replaceChildren(el('p', { class: 'empty' }, 'No login yet. Set people.my_login in the config, or wait until the app reads the token’s user with its next pull request update.'));
+      return;
+    }
+    const now = Date.now();
+    const rows = mine(repos, state.mineNeedsOnly);
+    const head = el('tr', { class: 'cols' }, MINE_COLUMNS.map((c) => {
+      const sorted = state.mineSort.key === c.key;
+      return el('th', {
+        title: c.title,
+        class: classes(sorted && 'sorted', sorted && state.mineSort.dir === 'asc' && 'asc'),
+        onclick: () => { state.mineSort = nextMineSort(state.mineSort, c.key); save('mineSort', state.mineSort); mineRedraw = true; render(); },
+      }, c.label);
+    }));
+    const body = el('tbody');
+    for (const r of rows) {
+      body.append(el('tr', { class: classes('mine-row', r.needsMe && 'needs-me'), dataset: { key: `${r.item.repo}#${r.item.number}` } },
+        MINE_COLUMNS.map((c) => el('td', { class: c.text ? 'text' : '' }, mineCell(c.key, r, login, now)))));
+    }
+    if (!rows.length) {
+      const text = state.mineNeedsOnly ? `Nothing by ${login} needs you right now.` : `No open pull requests by ${login} in the configured repos.`;
+      body.append(el('tr', {}, el('td', { colspan: MINE_COLUMNS.length, class: 'empty' }, text)));
+    }
+    main.replaceChildren(el('table', { class: 'people-table', id: 'mine-table' }, el('thead', {}, head), body));
+  }
+
+  /** Shows My PRs and draws it when it was hidden or something it shows changed. */
+  function renderMineView(snap: Snapshot): void {
+    const pane = $('mine-view');
+    const shown = pane.hidden;
+    pane.hidden = false;
+    const repos = snap.repos.map((r) => r.repo).join('\n');
+    if (shown || mineRedraw || repos !== mineDrawnFor) {
+      mineRedraw = false;
+      mineDrawnFor = repos;
+      renderMine(snap);
+    }
+  }
+
+  /** My PRs' badge: the pull requests whose blocker waits on you or that wait for your reply. */
+  function renderMineBadge(): void {
+    const needs = mine(state.snap?.repos.map((r) => r.repo) ?? [], true).length;
+    $('mine-count').textContent = needs ? String(needs) : '';
+    $('mine-count').title = `${needs} of your open pull requests wait on you or for your reply`;
+  }
+
   // ───────────────────────────── repo carets ─────────────────────────────
   // The caret on a row of the Repos table opens a detail row under it with
   // the repo's people in the table's window and its open work. The rows come
@@ -1035,6 +1151,8 @@ export function start(api: Api): () => void {
     $('repos-view').hidden = state.view !== 'repos';
     $('urgent-view').hidden = state.view !== 'urgent';
     if (state.view !== 'people') $('people-view').hidden = true;
+    if (state.view !== 'mine') $('mine-view').hidden = true;
+    renderMineBadge();
     if (state.view === 'repos') {
       // Redrawing the table removes the focused caret, so its focus key is read first.
       const focused = (document.activeElement as HTMLElement | null)?.dataset?.focus;
@@ -1042,6 +1160,7 @@ export function start(api: Api): () => void {
       renderRepoCarets(focused);
     }
     else if (state.view === 'people') renderPeopleView(snap);
+    else if (state.view === 'mine') renderMineView(snap);
     else renderUrgent(snap);
   }
 
@@ -1100,11 +1219,18 @@ export function start(api: Api): () => void {
     save('rankSort', state.rankSort);
     redrawPeople();
   });
+  $('mine-needs').addEventListener('change', (e) => {
+    state.mineNeedsOnly = (e.target as HTMLInputElement).checked;
+    save('mineNeedsOnly', state.mineNeedsOnly);
+    mineRedraw = true;
+    render();
+  });
   api.listen<PeopleView>('craft:people', (v) => {
     state.people = v;
     // The carets' tables come from the same records: open ones ask again.
     newPeopleView();
     renderPeopleBadge();
+    mineRedraw = true;
     redrawPeople();
   });
   api.invoke<PeopleView | null>('get_people').then((v) => {
@@ -1112,6 +1238,7 @@ export function start(api: Api): () => void {
     if (!v || state.people) return;
     state.people = v;
     renderPeopleBadge();
+    mineRedraw = true;
     redrawPeople();
   }).catch((e: unknown) => console.warn(e));
   document.addEventListener('keydown', (e) => {
@@ -1121,6 +1248,7 @@ export function start(api: Api): () => void {
     else if (mod && e.key === '1') setView('repos');
     else if (mod && e.key === '2') setView('urgent');
     else if (mod && e.key === '4') setView('people');
+    else if (mod && e.key === '5') setView('mine');
   });
 
   api.listen<Snapshot>('craft:snapshot', (s) => { state.snap = s; render(); });

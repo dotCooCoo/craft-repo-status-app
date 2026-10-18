@@ -321,6 +321,16 @@ impl GitHub {
         Ok(v["data"].take())
     }
 
+    /// The login of the user the token belongs to, from one
+    /// `viewer { login }` query.
+    pub fn viewer_login(&self) -> Result<String> {
+        let v = self.graphql_body("query { viewer { login } }", json!({}))?;
+        match v["data"]["viewer"]["login"].as_str() {
+            Some(login) => Ok(login.to_string()),
+            None => Err(Error::GraphQl(error_messages(graphql_errors(&v)))),
+        }
+    }
+
     /// Everything the UI shows for `owner/name`, measured at `now`. `raw` is
     /// the activity kept from the previous fetch; it's brought up to date
     /// only when the whole fetch succeeds.
@@ -1549,6 +1559,24 @@ mod tests {
         assert!(Error::GraphQl("Something went wrong: timeout".into()).is_overload());
         assert!(!Error::Http(404, "Not Found".into()).is_overload());
         assert!(!Error::RateLimited("later".into()).is_overload());
+    }
+
+    #[test]
+    fn the_viewer_query_gives_the_token_users_login() {
+        let (api, requests) = stub(vec![
+            ok_json(r#"{"data": {"viewer": {"login": "Ann-Example"}}}"#),
+            ok_json(r#"{"data": null, "errors": [{"message": "Bad credentials"}]}"#),
+        ]);
+        let gh = GitHub::with_api("t", api).unwrap();
+        assert_eq!(gh.viewer_login().unwrap(), "Ann-Example");
+        assert!(requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .contains("viewer { login }"));
+        match gh.viewer_login() {
+            Err(Error::GraphQl(msg)) => assert_eq!(msg, "Bad credentials"),
+            other => panic!("{other:?}"),
+        }
     }
 
     pub(crate) fn ok_json(body: &str) -> String {

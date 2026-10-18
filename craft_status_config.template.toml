@@ -69,6 +69,9 @@ rebase_repos = ["storytold/vectorcraft", "storytold/figcraft"]
 # a landed pull request may close without merging. The People tab's rankings
 # mark their merge and landed counts as unverified.
 batch_repos = ["storytold/designcraft", "storytold/deckcraft"]
+# The GitHub login whose open pull requests the My PRs tab lists. Leave empty
+# for the user the GitHub token belongs to.
+my_login = ""
 
 # Owners of one repo, in place of owner_logins:
 # [people.repo_owners]

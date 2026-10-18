@@ -70,6 +70,9 @@ pub struct PeopleConfig {
     /// through a batch branch, so a landed pull request may close without
     /// merging. The rankings mark their merge and landed counts unverified.
     pub batch_repos: Vec<String>,
+    /// The login whose open pull requests the My PRs tab lists; empty for
+    /// the user the GitHub token belongs to.
+    pub my_login: String,
 }
 
 /// The repos whose maintainers rebase contributors' branches, by default.
@@ -86,6 +89,7 @@ impl Default for PeopleConfig {
             maintainers: Vec::new(),
             rebase_repos: DEFAULT_REBASE_REPOS.iter().map(|s| s.to_string()).collect(),
             batch_repos: DEFAULT_BATCH_REPOS.iter().map(|s| s.to_string()).collect(),
+            my_login: String::new(),
         }
     }
 }
@@ -115,6 +119,12 @@ impl PeopleConfig {
             .any(|r| r.eq_ignore_ascii_case(repo))
     }
 
+    /// The login [`PeopleConfig::my_login`] names, or `None` when it is empty.
+    pub fn my_login(&self) -> Option<String> {
+        let l = self.my_login.trim();
+        (!l.is_empty()).then(|| l.to_string())
+    }
+
     /// This table as [`Config::parse`] reads it: the roster trimmed, logins
     /// trimmed with invalid ones and repeats dropped, and `repo_owners`
     /// keyed by `owner/name`, a repo listed twice keeping its first entry.
@@ -134,6 +144,9 @@ impl PeopleConfig {
             maintainers: logins(&self.maintainers),
             rebase_repos: repo_list(&self.rebase_repos),
             batch_repos: repo_list(&self.batch_repos),
+            my_login: logins(std::slice::from_ref(&self.my_login))
+                .pop()
+                .unwrap_or_default(),
         }
     }
 }
@@ -416,6 +429,16 @@ mod tests {
         assert!(
             c.people.batches("Storytold/DesignCraft"),
             "the default list"
+        );
+        assert_eq!(c.people.my_login(), None, "the token's user by default");
+        let c = Config::parse("[people]\nmy_login = \" Ann-Example \"\n").unwrap();
+        assert_eq!(c.people.my_login, "Ann-Example");
+        assert_eq!(c.people.my_login().as_deref(), Some("Ann-Example"));
+        let c = Config::parse("[people]\nmy_login = \"not a login\"\n").unwrap();
+        assert_eq!(
+            c.people.my_login(),
+            None,
+            "a bad login is dropped, so the token's user is listed"
         );
     }
 

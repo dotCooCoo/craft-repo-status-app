@@ -65,8 +65,9 @@ pub fn classify_repo(input: &RepoInput, now: Time) -> BTreeMap<u64, WorkState> {
 /// record (also kept in its `derived.state`, which the ledger reads), the
 /// directory of people with the roster, [`build`]'s view, and the rankings
 /// with each merged record's type and area (also kept in its `derived`).
-/// `release_at` gives a repository's latest build time, and `direct` its
-/// commits outside pull requests, by repository in any letter case.
+/// The view carries `people.my_login`. `release_at` gives a repository's
+/// latest build time, and `direct` its commits outside pull requests, by
+/// repository in any letter case.
 pub fn assemble(
     caches: &mut [(String, PrCache)],
     people: &PeopleConfig,
@@ -128,6 +129,7 @@ pub fn assemble(
         })
         .collect();
     let mut view = build(&inputs, &works, &dir, now);
+    view.my_login = people.my_login();
     let rank_inputs: Vec<RankInput> = caches
         .iter()
         .zip(&works)
@@ -239,6 +241,23 @@ pub struct Item {
     pub author: Option<String>,
     pub created_at: Option<Time>,
     pub work: WorkState,
+    /// The latest maintainer request the author has not answered and no
+    /// later approval resolved, as rule 40 of the work states finds it.
+    pub reply: Option<Reply>,
+}
+
+/// A maintainer request that waits for the author's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Reply {
+    pub at: Option<Time>,
+    /// The maintainer who made it.
+    pub by: String,
+    /// What it asks for, such as `rebase` or `split`.
+    pub subtype: String,
+    /// The comment or review that made it, or the pull request when GitHub
+    /// gave no link.
+    pub url: String,
 }
 
 /// What a person's pull requests did in one window.
@@ -339,6 +358,12 @@ pub struct PeopleView {
     /// When each repository's records were last brought up to date (see
     /// `PrCache::checked_at`); `None` for a repository never checked.
     pub checked: BTreeMap<String, Option<Time>>,
+    /// The login of the user the GitHub token belongs to; `None` until the
+    /// app has read it.
+    pub viewer: Option<String>,
+    /// `people.my_login` from the config, which the My PRs tab lists in
+    /// place of `viewer`.
+    pub my_login: Option<String>,
 }
 
 /// The start of each window for `repo`; a repository without a build has
@@ -462,6 +487,18 @@ pub fn build(
                 .filter(|_| r.fetched_at.is_some())
                 .map(|_| states::timings(r, &ctx));
             if r.state == PrState::Open {
+                let reply = tm.as_ref().and_then(|tm| {
+                    tm.requests
+                        .iter()
+                        .rev()
+                        .find(|q| q.answered.is_none() && !q.resolved)
+                        .map(|q| Reply {
+                            at: q.at,
+                            by: q.by.clone(),
+                            subtype: q.subtype.clone(),
+                            url: q.url.clone(),
+                        })
+                });
                 view.items.push(Item {
                     repo: repo.to_string(),
                     number: r.number,
@@ -474,6 +511,7 @@ pub fn build(
                     author: author.clone(),
                     created_at: r.created_at,
                     work: work.clone(),
+                    reply,
                 });
                 if let Some(a) = &human_author {
                     acc.entry(a.clone()).or_default().active = true;
@@ -847,6 +885,20 @@ mod tests {
         assert_eq!(item.author.as_deref(), Some("ann-example"));
         assert_eq!(item.work.state, "changes_requested_by_maintainer");
         assert_eq!(item.work.waits_for, ["ann-example", "boss-one"]);
+        let reply = item
+            .reply
+            .as_ref()
+            .expect("the rebase request waits for an answer");
+        assert_eq!(
+            (reply.by.as_str(), reply.at, reply.subtype.as_str()),
+            ("maint-one", Some(t(2, 1)), "rebase")
+        );
+        assert_eq!(
+            reply.url, "https://github.com/o/app/pull/1",
+            "a comment without a link of its own"
+        );
+        assert_eq!(v.items[2].reply, None, "#6: its maintainer approved later");
+        assert_eq!(v.items[1].reply, None, "#4: no timeline read yet");
         let unread = &v.items[1];
         assert_eq!(
             (unread.work.state.as_str(), unread.author.as_deref()),
@@ -958,6 +1010,24 @@ mod tests {
         assert_eq!(rec.derived.kind.as_ref().unwrap().value, "docs");
         assert_eq!(rec.derived.area.as_ref().unwrap().value, "docs");
         assert_eq!(rk.credits.len(), 1);
+        assert_eq!(
+            (v.my_login, v.viewer),
+            (None, None),
+            "no login set; the app adds the token user's"
+        );
+        let people = PeopleConfig {
+            my_login: "Bo-Example".into(),
+            ..Default::default()
+        };
+        let (v, _, _) = assemble(
+            &mut caches,
+            &people,
+            &roster,
+            |_| None,
+            &BTreeMap::new(),
+            t(20, 0),
+        );
+        assert_eq!(v.my_login.as_deref(), Some("Bo-Example"));
     }
 
     #[test]

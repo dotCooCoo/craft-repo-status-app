@@ -11,6 +11,7 @@ import {
   rankSortFor, PRODUCT, loadText, linesText, batchText, guessTip, workLead, repoFigures,
 } from './model.ts';
 import type { Flow, Given, Item, PeopleView, PersonResponse, PersonRow, Rank, RankRow, WorkState } from './model.ts';
+import { blockerOf, heldTip, isHeld, mineRows, mineValue, myLogin, nextMineSort, replyTip, waitsText } from './model.ts';
 
 const entry = (repo: string, stats: Partial<RepoStats> | null, fetched_at: string | null = '2026-10-08T12:00:00Z'): RepoEntry =>
   ({ repo: `o/${repo}`, stats: stats as RepoStats | null, fetched_at });
@@ -534,4 +535,69 @@ test('a repo’s figures group its open work, queues, holds, health and flow', (
   assert.equal(f.flow?.merged, 3);
   assert.deepEqual(f.main?.failing, ['test']);
   assert.equal(repoFigures(v, 'o/beta', '7d', PNOW).flow, null);
+});
+
+// ───────────────────────────── my prs ─────────────────────────────
+
+test('My PRs lists the login’s items in the configured repos, from the config’s login or else the token’s', () => {
+  assert.equal(myLogin({ my_login: 'Bo-Example', viewer: 'Ann-Example' }), 'Bo-Example');
+  assert.equal(myLogin({ my_login: null, viewer: 'Ann-Example' }), 'Ann-Example');
+  assert.equal(myLogin({}), null);
+  assert.equal(myLogin(null), null);
+  const v = peopleView();
+  v.items.push(
+    pitem('o/gone', 9, 'ann-example', { state: 'merge_conflict', waits_on: ['author'], waits_for: ['ann-example'] }),
+    pitem('O/Beta', 10, 'ann-example', { state: 'maintainer_engaged_ready_to_merge', waits_for: ['maint-one'], since: hoursAgo(1) }),
+    pitem('o/beta', 11, 'ann-example', { state: 'ci_running', waits_on: ['ci'], since: hoursAgo(1) }),
+    pitem('o/alpha', 12, 'ann-example', UNREAD_WORK),
+  );
+  v.items[1]!.reply = { at: hoursAgo(48), by: 'maint-one', subtype: 'rebase', url: 'https://github.com/o/alpha/pull/2#issuecomment-21' };
+  const repos = ['o/alpha', 'o/beta'];
+  const rows = mineRows(v, repos, 'Ann-Example', { key: 'blocker', dir: 'asc' }, PNOW);
+  assert.deepEqual(rows.map((r) => r.item.number), [3, 2, 11, 1, 10, 12],
+    'on you (in rule order), then CI, then others, then ready, then not read yet; o/gone is not configured and bo’s items are not theirs');
+  assert.deepEqual(rows.map((r) => [r.blocker.label, r.blocker.tone]), [
+    ['Draft', 'me'], ['Changes requested', 'me'], ['Checks running', 'ci'], ['Held', 'them'], ['Ready', 'ready'], ['Not read yet', 'unread'],
+  ]);
+  assert.deepEqual(rows.map((r) => r.needsMe), [true, true, false, false, false, false]);
+  assert.deepEqual(rows.map((r) => r.held), [false, false, false, true, false, false]);
+  assert.equal(rows[1]!.reply?.by, 'maint-one');
+  const needs = mineRows(v, repos, 'ann-example', { key: 'blocker', dir: 'asc' }, PNOW, true);
+  assert.deepEqual(needs.map((r) => r.item.number), [3, 2]);
+  // Other columns sort, with missing values last.
+  const by = (key: string, dir: 'asc' | 'desc') => mineRows(v, repos, 'ann-example', { key, dir }, PNOW).map((r) => r.item.number);
+  assert.deepEqual(by('reply', 'desc'), [2, 1, 12, 3, 10, 11], 'the request first, the rest by repo and number');
+  assert.deepEqual(by('held', 'desc'), [1, 2, 12, 3, 10, 11]);
+  assert.deepEqual(by('in_state', 'desc'), [1, 2, 3, 12, 10, 11]);
+  assert.deepEqual(by('number', 'desc'), [12, 11, 10, 3, 2, 1]);
+  assert.deepEqual(by('repo', 'asc'), [1, 2, 12, 3, 10, 11]);
+  assert.equal(mineValue(rows[1]!, 'reply', 'ann-example', PNOW), 48 * 3600);
+  assert.equal(mineValue(rows[0]!, 'reply', 'ann-example', PNOW), null);
+  assert.deepEqual(nextMineSort({ key: 'blocker', dir: 'asc' }, 'blocker'), { key: 'blocker', dir: 'desc' });
+  assert.deepEqual(nextMineSort({ key: 'blocker', dir: 'asc' }, 'age'), { key: 'age', dir: 'desc' });
+  assert.deepEqual(nextMineSort({ key: 'age', dir: 'desc' }, 'blocker'), { key: 'blocker', dir: 'asc' });
+  assert.deepEqual(nextMineSort({ key: 'age', dir: 'desc' }, 'title'), { key: 'title', dir: 'asc' });
+});
+
+test('a blocker names the state in short words and says who it waits on; Held also counts a hold behind an earlier rule', () => {
+  const i = (w: Partial<WorkState>) => pitem('o/alpha', 1, 'ann-example', w);
+  const b = (w: Partial<WorkState>) => { const x = blockerOf(i(w), 'ann-example'); return [x.label, x.tone]; };
+  assert.deepEqual(b({ state: 'merge_conflict', waits_on: ['author'], waits_for: ['ann-example'] }), ['Conflicting', 'me']);
+  assert.deepEqual(b({ state: 'ci_failing_from_pr', waits_on: ['author'], waits_for: ['ann-example'] }), ['Failing checks', 'me']);
+  assert.deepEqual(b({ state: 'ci_failing_inherited_from_main', waits_on: ['maintainer'] }), ['Failing on main', 'them']);
+  assert.deepEqual(b({ state: 'ci_awaiting_workflow_approval', waits_on: ['maintainer'] }), ['Waiting for approval', 'them']);
+  assert.deepEqual(b({ state: 'community_approved_awaiting_maintainer' }), ['Approved', 'ready']);
+  assert.deepEqual(b({ state: 'depends_on_other_pr', waits_on: ['other_pr'], blocked_by: [7, 8] }), ['Depends on #7, #8', 'them']);
+  assert.deepEqual(b({ state: 'superseded_still_open' }), ['Superseded, still open', 'them'], 'the People tab’s label');
+  assert.deepEqual(b(UNREAD_WORK), ['Not read yet', 'unread'], 'a record the app has not read has no blocker yet');
+  assert.equal(isHeld(i({ state: 'author_stepped_back', also: ['held_for_owner'] })), true);
+  assert.equal(isHeld(i({ state: 'changes_requested_by_maintainer', flags: ['also_held_for_owner'] })), true);
+  assert.equal(isHeld(i({ state: 'draft' })), false);
+  assert.equal(waitsText(i({ waits_on: ['author', 'owner'], waits_for: ['ann-example', 'boss-one'] }), 'Ann-Example'), 'you, the owner');
+  assert.equal(waitsText(i({ waits_on: ['maintainer'], waits_for: ['maint-one'] }), 'ann-example'), 'a maintainer');
+  assert.equal(waitsText(i({ waits_on: [] }), 'ann-example'), 'nobody');
+  assert.equal(waitsText(i(UNREAD_WORK), 'ann-example'), 'nobody yet');
+  assert.match(replyTip({ at: hoursAgo(5), by: 'maint-one', subtype: 'split_request', url: '' }, PNOW), /^maint-one asked 5h ago \(split request\)/);
+  assert.match(heldTip(i(HOLD_WORK), PNOW), /^Held for 4d, by maint-one, reason: brand, held again 1d ago, waits on boss-one\.$/);
+  assert.match(heldTip(i({ state: 'author_stepped_back', also: ['held_for_owner'] }), PNOW), /An earlier rule decided the state/);
 });

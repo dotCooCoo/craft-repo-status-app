@@ -840,3 +840,100 @@ test('a repo caret keeps the keyboard focus when its row is drawn again', async 
   h.emit('craft:snapshot', snapshot([repo('alpha', { urgency: 100 }, { fetched_at: later }), repo('beta', {}), repo('gamma', {})]));
   assert.equal((h.doc.activeElement as HTMLElement | null)?.dataset?.focus, 'repo-caret:o/alpha', 'the caret has the focus');
 });
+
+// ───────────────────────────── my prs ─────────────────────────────
+
+const mineKeys = (h: Harness) => [...h.doc.querySelectorAll<HTMLElement>('#mine-table tr.mine-row')].map((r) => r.dataset.key);
+const mineRow = (h: Harness, key: string) => h.doc.querySelector<HTMLTableRowElement>(`#mine-table tr[data-key="${key}"]`)!;
+const mineText = (h: Harness) => h.doc.getElementById('mine-main')!.textContent!;
+const REQUEST_URL = 'https://github.com/o/alpha/pull/2#issuecomment-21';
+const setChecked = (h: Harness, box: HTMLInputElement, on: boolean) => {
+  box.checked = on;
+  box.dispatchEvent(new h.win.Event('change', { bubbles: true }) as unknown as Event);
+};
+
+test('the My PRs tab and Cmd+5 open the login’s open pull requests with blocker, reply and held chips, filtered and sorted', async () => {
+  const view = { ...people(), viewer: 'Ann-Example' };
+  view.items[1]!.reply = { at: hoursBack(30), by: 'maint-one', subtype: 'rebase', url: REQUEST_URL };
+  view.items.push(prItem('elsewhere', 8, 'ann-example', { state: 'merge_conflict', waits_on: ['author'], waits_for: ['ann-example'] }));
+  const h = await setup({ host: (cmd) => (cmd === 'get_people' ? view : undefined) });
+  const tab = h.doc.querySelector<HTMLElement>('.view[data-view="mine"]')!;
+  assert.equal(tab.firstChild!.textContent!.trim(), 'My PRs');
+  assert.match(tab.title, /⌘5/);
+  assert.equal(h.doc.getElementById('mine-count')!.textContent, '2', '#2 and #3 wait on Ann');
+  keydown(h, '5', true);
+  assert.equal(h.doc.getElementById('mine-view')!.hidden, false);
+  assert.equal(h.doc.getElementById('repos-view')!.hidden, true);
+  assert.equal(tab.getAttribute('aria-selected'), 'true');
+  assert.equal(stored(h, 'view'), 'mine');
+  assert.match(h.doc.getElementById('mine-who')!.textContent!, /by Ann-Example in the 3 configured repos \(the token’s user/);
+  assert.deepEqual(mineKeys(h), ['o/beta#3', 'o/alpha#2', 'o/alpha#1'], 'on Ann first; o/elsewhere is not configured');
+  const held = mineRow(h, 'o/alpha#1');
+  const blocker = held.querySelector<HTMLElement>('.blocker')!;
+  assert.equal(blocker.textContent, 'Held');
+  assert.ok(blocker.classList.contains('tone-them') && blocker.classList.contains('guess'));
+  assert.match(blocker.title, /^Held for owner\nRule 10/);
+  blocker.click();
+  assert.deepEqual(h.calls.at(-1), { cmd: 'open_url', args: { url: COMMENT_URL } });
+  assert.match(held.cells[5]!.querySelector<HTMLElement>('.wstate')!.title, /^Held for 4d, by maint-one, reason: brand/);
+  assert.equal(held.cells[6]!.textContent, 'the owner');
+  const asked = mineRow(h, 'o/alpha#2');
+  assert.ok(asked.querySelector('.blocker')!.classList.contains('tone-me'));
+  const reply = asked.cells[4]!.querySelector<HTMLElement>('.wstate')!;
+  assert.equal(reply.textContent, 'Reply needed');
+  assert.match(reply.title, /^maint-one asked 1d ago \(rebase\)/);
+  reply.click();
+  assert.deepEqual(h.calls.at(-1), { cmd: 'open_url', args: { url: REQUEST_URL } });
+  assert.equal(asked.cells[6]!.textContent, 'you');
+  assert.equal(mineRow(h, 'o/beta#3').cells[4]!.textContent, '', 'no request on the draft');
+  // Needs me only, remembered.
+  setChecked(h, h.doc.getElementById('mine-needs') as HTMLInputElement, true);
+  assert.deepEqual(mineKeys(h), ['o/beta#3', 'o/alpha#2']);
+  assert.equal(stored(h, 'mineNeedsOnly'), true);
+  setChecked(h, h.doc.getElementById('mine-needs') as HTMLInputElement, false);
+  // A header sorts, and a second click flips it.
+  const th = (label: string) => [...h.doc.querySelectorAll<HTMLElement>('#mine-table th')].find((n) => n.textContent === label)!;
+  th('#').click();
+  assert.deepEqual(mineKeys(h), ['o/beta#3', 'o/alpha#2', 'o/alpha#1']);
+  th('#').click();
+  assert.deepEqual(mineKeys(h), ['o/alpha#1', 'o/alpha#2', 'o/beta#3']);
+  assert.deepEqual(stored(h, 'mineSort'), { key: 'number', dir: 'asc' });
+  // A login set in the config replaces the token’s user.
+  h.emit('craft:people', { ...view, my_login: 'bo-example' });
+  assert.deepEqual(mineKeys(h), ['o/beta#5']);
+  assert.doesNotMatch(h.doc.getElementById('mine-who')!.textContent!, /token/);
+  assert.equal(h.doc.getElementById('mine-count')!.textContent, '', 'nothing waits on bo');
+});
+
+test('a pull request by the login that the app has not read yet shows in My PRs as Not read yet', async () => {
+  const view = { ...people(), viewer: 'ann-example' };
+  view.items.push(prItem('beta', 9, 'ann-example', { state: NOT_READ_YET, waits_on: [], waits_for: [], since: hoursBack(6), rule: 'the timeline has not been read yet' }));
+  const h = await setup({ storage: { view: 'mine' }, host: (cmd) => (cmd === 'get_people' ? view : undefined) });
+  await tick();
+  assert.deepEqual(mineKeys(h), ['o/beta#3', 'o/alpha#2', 'o/alpha#1', 'o/beta#9'], 'after every state that has a blocker');
+  const row = mineRow(h, 'o/beta#9');
+  const chip = row.querySelector<HTMLElement>('.blocker')!;
+  assert.equal(chip.textContent, 'Not read yet');
+  assert.ok(chip.classList.contains('unread') && chip.classList.contains('tone-unread'));
+  assert.match(chip.title, /^Not read yet: the app has found this pull request/);
+  assert.equal(row.cells[6]!.textContent, 'nobody yet');
+  assert.equal(h.doc.getElementById('mine-count')!.textContent, '2', 'it does not count as waiting on Ann');
+});
+
+test('My PRs says when there are no records or no login yet, and redraws for a new view or repo list, not for every snapshot', async () => {
+  const h = await setup({ host: (cmd) => (cmd === 'get_people' ? null : undefined) });
+  keydown(h, '5', true);
+  assert.match(mineText(h), /No pull request records yet/);
+  h.emit('craft:people', people());
+  assert.match(mineText(h), /No login yet/);
+  assert.equal(h.doc.getElementById('mine-count')!.textContent, '');
+  h.emit('craft:people', { ...people(), viewer: 'ann-example' });
+  assert.deepEqual(mineKeys(h), ['o/beta#3', 'o/alpha#2', 'o/alpha#1']);
+  const table = h.doc.getElementById('mine-table');
+  h.emit('craft:snapshot', { ...snapshot(), fetching: 'o/alpha' });
+  h.emit('craft:snapshot', snapshot());
+  assert.ok(h.doc.getElementById('mine-table') === table, 'the same repos keep the table');
+  h.emit('craft:snapshot', snapshot([repo('beta', {})]));
+  assert.deepEqual(mineKeys(h), ['o/beta#3'], 'a repo left the list');
+  assert.equal(h.doc.getElementById('mine-count')!.textContent, '1');
+});

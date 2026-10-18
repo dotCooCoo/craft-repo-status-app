@@ -67,6 +67,8 @@ sort by a column again.
   by work state, who each one waits on, and their flow and reviews in a
   window, or the rankings. The tab's badge counts the open pull requests held
   for the owner. See [The People tab](#the-people-tab).
+- **My PRs** (`⌘5`) lists your open pull requests in the configured repos and
+  what blocks each one. See [The My PRs tab](#the-my-prs-tab).
 - **Freshness**: the header shows when the oldest data on screen was fetched,
   and a pill that reads `FRESH`, `REFRESHING` or **`STALE`**. Data is stale
   when any repo has gone `stale_minutes` (default 15) without a successful
@@ -206,6 +208,39 @@ the maintainer and author queues, the checks on `main`, the flow in the window
 and to the first maintainer response, merge methods and mergers), aging and
 stale counts, and pull requests that wait on or compete with another.
 
+### The My PRs tab
+
+The My PRs tab lists the open pull requests whose author is
+`people.my_login`, or the user the GitHub token belongs to when that is empty,
+in the configured repos. It reads the People tab's records and work states.
+The app reads the token's login with one GitHub query on its first pull
+request update after launch, and again after the token changes. The columns
+are Repo, #, Title, Blocker, Reply, Held, Waits on, In state and Opened, and
+every column sorts.
+
+- **Blocker** names the pull request's work state in short words, such as
+  Conflicting, Failing checks, Failing on main, Waiting for approval, Checks
+  running, Changes requested, Draft, Held, Awaiting review, Answered or
+  Ready. It is red when the state waits on you, blue while checks run, plain
+  when it waits on someone else and green when the pull request is approved
+  or ready to merge. A pull request the app has found but not read yet shows
+  Not read yet. By default the list sorts red first, then blue, plain, green
+  and Not read yet, and each group by rule order. Hover the chip for its rule
+  and matched sentence, as in the People tab; click it to open that comment.
+  In repos listed in `people.rebase_repos`, a conflict on a contributor's
+  pull request that maintainers can push to shows as `conflict` next to the
+  chip instead of as Conflicting.
+- **Reply** shows Reply needed when a maintainer request on the pull request
+  has no answer from you and no later approval resolved it (rule 40 of the
+  work states). Hover it for who asked, when and for what; click it to open
+  the request.
+- **Held** shows Held when the pull request is held for the owner, also when
+  a request made after the hold or an earlier rule decided its state. Hover
+  it for how long, by whom and why.
+
+Needs me only shows only the pull requests whose blocker waits on you or that
+need your reply. The tab's badge counts those pull requests.
+
 ## Polling and cache
 
 - The app fetches one repo at a time, 20 s apart: first any repo with no data
@@ -275,7 +310,7 @@ The app behaves like the Todo app:
 - The window is chrome-less and semi-transparent, and it appears on every
   Space. It remembers its position and size in `~/.craft_status_state.toml`.
 - `Esc` hides the window.
-- `⌘1`, `⌘2` and `⌘4` switch to Repos, Fix first and People.
+- `⌘1`, `⌘2`, `⌘4` and `⌘5` switch to Repos, Fix first, People and My PRs.
 
 ## Configuration: `~/.craft_status_config.toml`
 
@@ -303,6 +338,8 @@ The `[people]` table sets up the People tab:
   themselves.
 - `batch_repos`: repos that land work through a batch branch; their merge and
   landed counts are marked unverified.
+- `my_login` (default empty): the GitHub login whose open pull requests the
+  My PRs tab lists. Leave it empty for the user the GitHub token belongs to.
 
 ## Build, install, test
 

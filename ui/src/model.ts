@@ -427,6 +427,17 @@ export interface Item {
   author: string | null;
   created_at: Time | null;
   work: WorkState;
+  /** The latest maintainer request the author has not answered; null when none waits. */
+  reply?: Reply | null;
+}
+
+/** A maintainer request that waits for the author's answer: `Reply` in view.rs. */
+export interface Reply {
+  at: Time | null;
+  by: string;
+  /** What it asks for, such as rebase or split. */
+  subtype: string;
+  url: string;
 }
 
 export interface Flow {
@@ -495,6 +506,10 @@ export interface PeopleView {
   main: Record<string, MainChecks>;
   /** When each repo's records were last brought up to date; null for a repo never checked. */
   checked: Record<string, Time | null>;
+  /** The login of the user the GitHub token belongs to; null until the app has read it. */
+  viewer?: string | null;
+  /** `people.my_login` from the config, which My PRs lists in place of `viewer`. */
+  my_login?: string | null;
 }
 
 /** How far the first load of merged and closed pull requests has come: `Load` in view.rs. */
@@ -1191,4 +1206,155 @@ export function repoFigures(view: PeopleView, repo: string, window: string, now:
     flow: flowKey === undefined ? null : view.repos[flowKey]![window] ?? null,
     main: mainKey === undefined ? null : view.main[mainKey]!,
   };
+}
+
+// ───────────────────────────── my prs ─────────────────────────────
+// The My PRs tab lists the People view's open items whose author is one
+// login, in the configured repos, with a blocker from each item's work state.
+
+/** The login My PRs lists: `people.my_login` from the config, otherwise the token's user; null before either is known. */
+export function myLogin(view: Pick<PeopleView, 'my_login' | 'viewer'> | null | undefined): string | null {
+  return view?.my_login || view?.viewer || null;
+}
+
+/** Who a blocker waits on: you, CI, someone else, nobody because it is approved or ready to merge, or not known because the timeline has not been read. */
+export type Tone = 'me' | 'ci' | 'them' | 'ready' | 'unread';
+
+export interface Blocker { state: string; label: string; tone: Tone }
+
+/** Short blocker names for the work states; the other states keep their People tab label. */
+export const BLOCKER_LABELS: Readonly<Record<string, string>> = {
+  merge_conflict: 'Conflicting',
+  ci_failing_from_pr: 'Failing checks',
+  ci_failing_inherited_from_main: 'Failing on main',
+  ci_awaiting_workflow_approval: 'Waiting for approval',
+  ci_running: 'Checks running',
+  held_for_owner: 'Held',
+  maintainer_engaged_ready_to_merge: 'Ready',
+  community_approved_awaiting_maintainer: 'Approved',
+  changes_requested_by_maintainer: 'Changes requested',
+  community_changes_requested: 'Review findings',
+  author_marked_not_ready: 'Not ready',
+  awaiting_first_maintainer_response: 'Awaiting review',
+  author_responded_awaiting_maintainer: 'Answered',
+  author_declared_hold: 'Parked',
+  competing_prs_maintainer_choice: 'Competing',
+};
+
+const READY_STATES = new Set(['maintainer_engaged_ready_to_merge', 'community_approved_awaiting_maintainer']);
+const TONE_ORDER: Readonly<Record<Tone, number>> = { me: 0, ci: 1, them: 2, ready: 3, unread: 4 };
+
+/** Whether `item`'s work state waits on `login`. */
+const waitsOnLogin = (item: Item, login: string): boolean => item.work.waits_for.includes(login.toLowerCase());
+
+/** `item`'s blocker for `login`: the label of its work state, and whether that state is approved or ready to merge, waits on CI, on them, on someone else, or has not been read yet. */
+export function blockerOf(item: Item, login: string): Blocker {
+  const w = item.work;
+  const tone: Tone = w.state === NOT_READ_YET ? 'unread'
+    : READY_STATES.has(w.state) ? 'ready'
+    : w.state === 'ci_running' ? 'ci'
+    : waitsOnLogin(item, login) ? 'me' : 'them';
+  const label = w.state === 'depends_on_other_pr' && w.blocked_by.length
+    ? `Depends on ${w.blocked_by.map((n) => `#${n}`).join(', ')}`
+    : BLOCKER_LABELS[w.state] ?? stateLabel(w.state);
+  return { state: w.state, label, tone };
+}
+
+/** Whether `item` is held for the owner: its state, a request that also carries a hold, or a hold that an earlier rule outranked. */
+export const isHeld = (i: Item): boolean => held(i) || i.work.also.includes('held_for_owner');
+
+/** Who `item` waits on, with "you" for `login`. */
+export function waitsText(item: Item, login: string): string {
+  const mine = waitsOnLogin(item, login);
+  const others = item.work.waits_on.filter((r) => !(mine && r === 'author')).map((r) => ROLE_LABELS[r]);
+  const parts = mine ? ['you', ...others] : others;
+  return parts.length ? parts.join(', ') : ROLE_LABELS[firstRole(item.work)];
+}
+
+/** One row of My PRs. `needsMe`: its blocker waits on you, or a maintainer request waits for your reply. */
+export interface MineRow { item: Item; blocker: Blocker; reply: Reply | null; held: boolean; needsMe: boolean }
+
+export interface MineColumn { key: string; label: string; title: string; text?: boolean; asc?: boolean }
+
+export const MINE_COLUMNS: readonly MineColumn[] = [
+  { key: 'repo', label: 'Repo', title: 'Repository', text: true },
+  { key: 'number', label: '#', title: 'Pull request number' },
+  { key: 'title', label: 'Title', title: 'Pull request title', text: true },
+  { key: 'blocker', label: 'Blocker', title: 'What it waits for, from its work state: on you first, then CI, then other people, then approved or ready to merge, then not read yet', asc: true },
+  { key: 'reply', label: 'Reply', title: 'A maintainer request you have not answered; the oldest sorts first' },
+  { key: 'held', label: 'Held', title: 'Held for the owner’s decision; the longest held sorts first' },
+  { key: 'waits', label: 'Waits on', title: 'Who its work state waits on', text: true },
+  { key: 'in_state', label: 'In state', title: 'How long it has been in its work state; for a pull request not read yet, since GitHub last saw it change' },
+  { key: 'age', label: 'Opened', title: 'How long ago it was opened' },
+];
+
+/** The value of My PRs column `key` for `row`, for sorting; null sorts last. */
+export function mineValue(row: MineRow, key: string, login: string, now: number): number | string | null {
+  const i = row.item;
+  switch (key) {
+    case 'repo': return (i.repo.split('/').pop() ?? i.repo).toLowerCase();
+    case 'number': return i.number;
+    case 'title': return i.title.toLowerCase();
+    case 'blocker': return TONE_ORDER[row.blocker.tone] * 100 + (STATE_ORDER.get(i.work.state) ?? 99);
+    case 'reply': return row.reply ? since(row.reply.at, now) ?? 0 : null;
+    case 'held': return row.held ? since(i.work.hold?.since, now) ?? 0 : null;
+    case 'waits': return waitsText(i, login);
+    case 'in_state': return ageSecs(i, now);
+    case 'age': return since(i.created_at, now);
+    default: return null;
+  }
+}
+
+/** `login`'s open pull requests in `repos` (any letter case), sorted by `sort` (missing values last, ties by repo and number); with `needsMeOnly`, only those that need them. */
+export function mineRows(view: PeopleView, repos: readonly string[], login: string, sort: Sort, now: number, needsMeOnly = false): MineRow[] {
+  const me = login.toLowerCase();
+  const listed = new Set(repos.map((r) => r.toLowerCase()));
+  const rows = view.items
+    .filter((i) => i.author === me && listed.has(i.repo.toLowerCase()))
+    .map((item): MineRow => {
+      const blocker = blockerOf(item, login);
+      const reply = item.reply ?? null;
+      return { item, blocker, reply, held: isHeld(item), needsMe: blocker.tone === 'me' || reply !== null };
+    })
+    .filter((r) => !needsMeOnly || r.needsMe);
+  const sign = sort.dir === 'asc' ? 1 : -1;
+  const tie = (a: MineRow, b: MineRow) => a.item.repo.toLowerCase().localeCompare(b.item.repo.toLowerCase()) || a.item.number - b.item.number;
+  return rows.sort((a, b) => {
+    const x = mineValue(a, sort.key, login, now);
+    const y = mineValue(b, sort.key, login, now);
+    if (x !== y) {
+      if (x === null) return 1;
+      if (y === null) return -1;
+      return (x < y ? -1 : 1) * sign;
+    }
+    return tie(a, b);
+  });
+}
+
+/** The next sort for a click on My PRs column `key`: text columns and Blocker start ascending, the rest descending. */
+export function nextMineSort(sort: Sort, key: string): Sort {
+  if (sort.key === key) return { key, dir: sort.dir === 'asc' ? 'desc' : 'asc' };
+  const col = MINE_COLUMNS.find((c) => c.key === key);
+  return { key, dir: col?.text || col?.asc ? 'asc' : 'desc' };
+}
+
+/** "5h ago", or "just now". */
+const agoText = (iso: Time, now: number): string => {
+  const a = ago(iso, now);
+  return a === 'now' ? 'just now' : `${a} ago`;
+};
+
+/** The hover text of a Reply chip: who asked, when and for what. */
+export function replyTip(r: Reply, now: number = Date.now()): string {
+  const when = r.at ? agoText(r.at, now) : 'at an unknown time';
+  return `${r.by} asked ${when}${r.subtype ? ` (${r.subtype.replaceAll('_', ' ')})` : ''}, and you have not answered since.\nClick to open the request.`;
+}
+
+/** The hover text of a Held chip: for how long, by whom and why, or that an earlier rule decided the state. */
+export function heldTip(i: Item, now: number = Date.now()): string {
+  const h = i.work.hold;
+  if (!h) return 'Held for the owner. An earlier rule decided the state, so the hold’s details are not shown. Hover the blocker for the rules that matched.';
+  const bits = [h.since ? `Held for ${ago(h.since, now)}` : 'Held', h.by && `by ${h.by}`, h.category && `reason: ${h.category}`,
+    h.reaffirmed && `held again ${agoText(h.reaffirmed, now)}`, h.owners.length ? `waits on ${h.owners.join(', ')}` : ''];
+  return bits.filter(Boolean).join(', ') + '.';
 }
