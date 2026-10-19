@@ -341,6 +341,7 @@ fn decision(value: &str, rule: impl Into<String>) -> Decision {
     Decision {
         value: value.to_string(),
         rule: rule.into(),
+        subtype: None,
     }
 }
 

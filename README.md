@@ -65,8 +65,9 @@ sort by a column again.
   [The People tab](#the-people-tab)).
 - **People** (`⌘4`) shows one row per person with their open pull requests
   by work state, who each one waits on, and their flow and reviews in a
-  window, or the rankings. The tab's badge counts the open pull requests held
-  for the owner. See [The People tab](#the-people-tab).
+  window, or the rankings. With `people.track_record` on, it also shows each
+  contributor's review level per repo. The tab's badge counts the open pull
+  requests held for the owner. See [The People tab](#the-people-tab).
 - **My PRs** (`⌘5`) lists your open pull requests in the configured repos and
   what blocks each one. See [The My PRs tab](#the-my-prs-tab).
 - **Freshness**: the header shows when the oldest data on screen was fetched,
@@ -198,6 +199,87 @@ repo picked, the tables cover that repo alone. Each row gives their merged
 pull requests, their product lines and their share of their own total. Click a
 directory, or press `Enter` or `Space` on it, to list its modules under
 `src/`. Hover an area or a type for the rule that decided it.
+
+**Track record** (the third button, shown only when `people.track_record` is
+on) lists one row per person per repo with a review level: **Trusted**,
+**Review**, **Untrusted** or **Not enough record**. Only confirmed faults that
+GitHub fields show set a level, at most one per pull request
+(`crates/craft-core/src/people/track.rs`):
+
+- a merged pull request reverts the work, unless a later pull request replaced
+  it, the work's merge commit also landed other authors' pull requests (a batch
+  push), the revert was itself reverted, or it was one of three or more reverts
+  within 10 minutes with no failure named. A co-authored pull request is still
+  its author's. The revert names the work by GitHub's "Reverts #N" line, by the
+  work's merge commit or a commit its author wrote on the branch, or, when it
+  names no commit, by quoting the work's title. A revert of a commit someone
+  else pushed to the branch, or of a commit that belongs to no pull request,
+  does not count against the author. A pull request the revert names in a
+  sentence with a defect word is not taken as the replacement;
+- the body ticks "`cargo xtask ci`" while a check on the head failed that
+  passed on the head of `main` when the check ran, is not in
+  `people.flaky_checks` and was not waiting for workflow approval. The app
+  knows `main`'s head at a time only when two sweeps, one at or before that
+  time and one at or after it, saw the same commit there with the same
+  results. It dates the head's checks from the oldest check suite's start to
+  the newest one's. A failure does not count when `main` is not known to have
+  passed that check throughout those times, when it is a failing commit
+  status, when the head has more than 8 check suites, or when the pull request
+  was read before the app recorded commit statuses and suite counts;
+- a maintainer closed it, it landed nowhere, no merged pull request that
+  references it did so or merged within 7 days of the close, no other pull
+  request closed the same issue or competed for it, and the work states did not
+  find it superseded, yielded to another pull request, or closed by accident
+  within an hour of opening;
+- it closed as the copy of a pull request opened more than 12 hours earlier,
+  linked to it and sharing an issue, by a maintainer or by the author more than
+  an hour after opening. A pull request opened after the earlier one closed
+  without landing is a resubmission, not a copy.
+
+A follow-up fix never counts, since the records hold each pull request's
+changed files but not its changed lines. A merged pull request that names the
+work, was opened after the work landed and merged within 14 days of it is
+listed instead. When a sentence naming the work has a defect word (fail,
+broke, regression, crash, wrong, bug and the like) and the pull request
+changes a product file the work changed, it is listed as found by you when you
+wrote it, as a maintainer revision when whoever merged or pushed to the work
+wrote it, and otherwise as a possible follow-up. One that cites the work with a
+precedent phrase such as "in the same way" or "like #N" is listed as a
+precedent, and any other as a possible follow-up with the reason it falls
+short. A sentence with a precedent phrase or a term from
+`people.gate_excluded_terms` is not read as naming a defect.
+
+The fault rate is faults over counted pull requests: those at least 7 days old
+that landed more than 72 hours ago, or that closed as a maintainer's decline or
+a late duplicate. A ticked box on a pull request closed any other way is
+listed but not counted. The rate's Wilson 90% interval is compared with the
+baseline, the pooled rate of the other authors in the repo with a long enough
+record, or of every repo's when the repo has fewer than 5 such authors. The
+baseline has its own Wilson 90% interval, from the pooled faults and counted
+pull requests. Untrusted means the person's lower bound lies above the
+baseline's upper bound. Trusted means the rate is at or below the baseline
+with no fault in the last 30 days. Review is everything else, including a
+lower bound above the baseline that is not above its upper bound. A person
+needs 5 counted pull requests, with 80% of their pull requests at least 7 days
+old decided, before any level but Not enough record. Not enough record also
+shows when no baseline exists, and it shows no rate. A pull request whose
+timeline the app has not read yet is not decided.
+Maintainers (logins with 3 or more merges or closes of others' pull requests
+among the repo's last 200 merged or closed ones, plus `people.maintainers` and
+the owners) and bots get no row. Your own rows, for `people.my_login` or else
+the token's user, follow the others under You and stay out of every baseline.
+
+The rows come grouped by level, the newest fault first, and Not enough record
+by first activity; no column sorts and no rank number shows. The repo picker
+limits the rows to one repo. Hover a level for its rule, the baseline's
+authors and each counted fault. The caret lists every fault and every event
+listed beside them, each with its pull request, date, rule and the other pull
+request, marked "involves you" when that one is yours. A fault in the last 7
+days shows a dated badge, and a first-time contributor a "new to this repo"
+tag. The app works the levels out from the records the People work already
+holds and sends no GitHub request for them, and no other view reads them.
+Reverts pushed straight to `main` without a pull request are not in those
+records, so they do not count.
 
 The caret on a row of the Repos table shows that repo's people for the table's
 window, with their merges, reviews and review commits, and its open work: open
@@ -340,6 +422,17 @@ The `[people]` table sets up the People tab:
   landed counts are marked unverified.
 - `my_login` (default empty): the GitHub login whose open pull requests the
   My PRs tab lists. Leave it empty for the user the GitHub token belongs to.
+- `track_record` (default `false`): shows the Track record view in the People
+  tab. While it is `false` the app does not build the view.
+- `track_record_window_days` (default 60, held to 14 to 365): how far back
+  the Track record reads, by the date each pull request was opened.
+- `flaky_checks` (default `{}`): checks by repo, as
+  `{ "owner/name" = ["check"] }`, whose failures never count as a pull
+  request's own in the Track record.
+- `gate_excluded_terms` (default
+  `{ "storytold/vectorcraft" = ["wasm32 clippy"] }`): terms by repo that mark
+  a failure outside the repo's gate. A follow-up whose sentence about a pull
+  request names one is not read as naming a defect.
 
 ## Build, install, test
 

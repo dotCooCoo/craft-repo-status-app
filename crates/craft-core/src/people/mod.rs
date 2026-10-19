@@ -3,8 +3,9 @@
 //! maintainers and owners, the team roster read at runtime, the per pull
 //! request records ([`record`]), the timestamped events derived from them
 //! ([`ledger`]), each pull request's work state ([`states`]), type and area
-//! ([`kind`]), who wrote its lines and the rankings ([`rank`]), and what the
-//! People tab shows ([`view`]).
+//! ([`kind`]), who wrote its lines and the rankings ([`rank`]), each
+//! contributor's track record ([`track`]), and what the People tab shows
+//! ([`view`]).
 
 pub mod kind;
 pub mod ledger;
@@ -12,6 +13,7 @@ pub mod rank;
 pub mod record;
 pub mod roster;
 pub mod states;
+pub mod track;
 pub mod view;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -105,6 +107,31 @@ pub fn parse_co_authors(message: &str) -> Vec<CoAuthor> {
         };
         if !out.contains(&a) {
             out.push(a);
+        }
+    }
+    out
+}
+
+/// The commits a commit reverts: the oids in its message's `This reverts
+/// commit <oid>` lines, lowercase, when its headline starts with `Revert "`
+/// as `git revert` writes it. A squash commit that only quotes such a line
+/// reverts nothing.
+pub fn parse_reverts(headline: &str, message: &str) -> Vec<String> {
+    if !headline.starts_with("Revert \"") {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for line in message.lines() {
+        let Some(rest) = line.trim().strip_prefix("This reverts commit ") else {
+            continue;
+        };
+        let oid: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if oid.len() >= 7 && !out.contains(&oid) {
+            out.push(oid);
         }
     }
     out
@@ -381,6 +408,18 @@ mod tests {
             ]
         );
         assert!(parse_co_authors("Co-authored-by:\n").is_empty());
+    }
+
+    #[test]
+    fn a_revert_commit_names_the_commits_it_reverts() {
+        let msg = "Revert \"Pen: smoother curves\"\n\nThis reverts commit ABCDEF1234567890.\n\
+                   This reverts commit abcdef1234567890.\nThis reverts commit 12ab.\n";
+        assert_eq!(
+            parse_reverts("Revert \"Pen: smoother curves\"", msg),
+            ["abcdef1234567890"]
+        );
+        // A squash commit that quotes the line is not a revert.
+        assert!(parse_reverts("Fix the pen (#12)", msg).is_empty());
     }
 
     #[test]

@@ -100,7 +100,13 @@ pub struct Checks {
     pub rollup: Option<String>,
     /// The names of the head commit's failing checks.
     pub failing: Vec<String>,
+    /// The names in `failing` that are commit statuses, not check runs;
+    /// `None` in a record that does not say.
+    pub failing_statuses: Option<Vec<String>>,
     pub suites: Vec<Suite>,
+    /// How many check suites the head commit has, of which `suites` holds
+    /// the first ones; `None` in a record that does not say.
+    pub suites_total: Option<u64>,
 }
 
 /// One check suite on the head commit.
@@ -224,6 +230,10 @@ pub struct PrCommit {
     pub co_authors: Vec<CoAuthor>,
     /// A merge of the base branch into the head (see [`super::is_merge_commit`]).
     pub is_merge: bool,
+    /// The commits a `Revert "…"` commit reverts, from its `This reverts
+    /// commit <oid>` lines (see [`super::parse_reverts`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reverts: Vec<String>,
 }
 
 /// One `Co-authored-by:` trailer.
@@ -265,6 +275,10 @@ pub struct Derived {
 pub struct Decision {
     pub value: String,
     pub rule: String,
+    /// The value's subtype, where the rule sets one (the work state's
+    /// `subtype`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<String>,
 }
 
 /// The fields the light sweep reads for an open pull request.
@@ -285,6 +299,8 @@ pub struct Light {
     pub comments_total: u64,
     pub rollup: Option<String>,
     pub suites: Vec<Suite>,
+    /// How many check suites the head commit has.
+    pub suites_total: Option<u64>,
 }
 
 impl PrRecord {
@@ -325,6 +341,7 @@ impl PrRecord {
         let failed = matches!(light.rollup.as_deref(), Some("FAILURE" | "ERROR"));
         if new_head {
             self.checks.failing.clear();
+            self.checks.failing_statuses = Some(Vec::new());
         }
         // A check suite that failed, recovered or ran again changes the
         // failing names, though the rollup may stay failed.
@@ -342,6 +359,7 @@ impl PrRecord {
             .set_mergeable(&light.mergeable, &light.merge_state, now);
         self.checks.rollup = light.rollup.clone();
         self.checks.suites = light.suites.clone();
+        self.checks.suites_total = light.suites_total;
         if light.updated_at > self.updated_at {
             self.stale = true;
         }
@@ -372,7 +390,9 @@ impl PrRecord {
         checks.set_mergeable(&new.checks.mergeable, &new.checks.merge_state, now);
         checks.rollup = new.checks.rollup.take();
         checks.failing = std::mem::take(&mut new.checks.failing);
+        checks.failing_statuses = new.checks.failing_statuses.take();
         checks.suites = std::mem::take(&mut new.checks.suites);
+        checks.suites_total = new.checks.suites_total;
         // File pages fetched after the first stay while the head is the same.
         let (old, fresh) = (&self.contribution, &new.contribution);
         if old.files.len() > fresh.files.len()
@@ -436,6 +456,10 @@ pub struct PrCache {
     pub swept_at: Option<Time>,
     /// The checks on the head of the default branch, from the light sweep.
     pub main_checks: Option<MainChecks>,
+    /// Each head of the default branch the sweeps saw, oldest first, with
+    /// when they first and last saw it (see [`PrCache::note_main`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub main_history: Vec<MainChecks>,
     /// The first-load walk over merged pull requests.
     pub merged_walk: Walk,
     /// The first-load walk over pull requests closed without merging, which
@@ -482,9 +506,69 @@ pub struct MainChecks {
     pub oid: String,
     pub rollup: Option<String>,
     pub failing: Vec<String>,
+    /// The checks that passed; empty in caches written before it was kept,
+    /// and when GitHub listed more checks than the sweep reads.
+    pub passing: Vec<String>,
+    /// In [`PrCache::main_history`]: the first and the last sweep that saw
+    /// this commit at the head of the default branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_seen: Option<Time>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<Time>,
 }
 
+/// [`PrCache::main_history`] keeps the entries last seen within this many
+/// days, the newest [`MAIN_HISTORY_LEN`] of them at most.
+pub const MAIN_HISTORY_DAYS: i64 = 366;
+pub const MAIN_HISTORY_LEN: usize = 5000;
+
 impl PrCache {
+    /// Records what a sweep at `now` read of the default branch's head:
+    /// it becomes [`PrCache::main_checks`], and [`PrCache::main_history`]
+    /// extends its newest entry when the sweep saw the same commit with the
+    /// same check results, or else starts a new entry. A rerun that changes
+    /// a result on the same commit starts a new entry, so no result is
+    /// dated before a sweep saw it.
+    pub fn note_main(&mut self, main: Option<MainChecks>, now: Time) {
+        self.main_checks = main.clone();
+        let Some(mut m) = main else { return };
+        match self.main_history.last_mut() {
+            Some(last)
+                if last.oid == m.oid
+                    && last.rollup == m.rollup
+                    && last.failing == m.failing
+                    && last.passing == m.passing =>
+            {
+                last.last_seen = Some(now);
+            }
+            _ => {
+                m.first_seen = Some(now);
+                m.last_seen = Some(now);
+                self.main_history.push(m);
+            }
+        }
+        let cutoff = now - chrono::Duration::days(MAIN_HISTORY_DAYS);
+        self.main_history
+            .retain(|e| e.last_seen.is_some_and(|at| at >= cutoff));
+        let extra = self.main_history.len().saturating_sub(MAIN_HISTORY_LEN);
+        self.main_history.drain(..extra);
+    }
+
+    /// The default branch's head and its check results throughout `from`
+    /// to `to`: the entry whose sweeps saw the same commit with the same
+    /// results both at or before `from` and at or after `to`. `None` when
+    /// no entry spans the whole time.
+    pub fn main_over(&self, from: Time, to: Time) -> Option<&MainChecks> {
+        self.main_history.iter().rev().find(|m| {
+            m.first_seen.is_some_and(|f| f <= from) && m.last_seen.is_some_and(|l| l >= to)
+        })
+    }
+
+    /// [`PrCache::main_over`] for the one moment `at`.
+    pub fn main_at(&self, at: Time) -> Option<&MainChecks> {
+        self.main_over(at, at)
+    }
+
     pub fn path(dir: &Path, repo: &str) -> PathBuf {
         dir.join("prs")
             .join(format!("{}.json", repo.replace('/', "@")))
@@ -549,6 +633,83 @@ mod tests {
     }
 
     #[test]
+    fn the_main_history_dates_each_head_and_result_between_the_sweeps_that_saw_it() {
+        let main = |oid: &str, passing: &[&str]| MainChecks {
+            oid: oid.into(),
+            passing: passing.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let passing = |m: Option<&MainChecks>| m.map(|m| (m.oid.clone(), m.passing.clone()));
+        let pair = |oid: &str, p: &[&str]| {
+            Some((
+                oid.to_string(),
+                p.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            ))
+        };
+        let mut c = PrCache::default();
+        c.note_main(Some(main("a", &["test"])), t("2026-10-01T00:00:00Z"));
+        c.note_main(Some(main("a", &["test"])), t("2026-10-01T02:00:00Z"));
+        c.note_main(Some(main("b", &["test"])), t("2026-10-01T03:00:00Z"));
+        // A rerun on the same commit passes FreeBSD.
+        c.note_main(
+            Some(main("b", &["test", "FreeBSD"])),
+            t("2026-10-01T04:00:00Z"),
+        );
+        assert_eq!(c.main_checks.as_ref().map(|m| m.oid.as_str()), Some("b"));
+        assert_eq!(c.main_checks.as_ref().and_then(|m| m.first_seen), None);
+        assert_eq!(c.main_history.len(), 3);
+        assert_eq!(
+            passing(c.main_at(t("2026-10-01T01:00:00Z"))),
+            pair("a", &["test"])
+        );
+        assert_eq!(
+            c.main_at(t("2026-10-01T02:30:00Z")),
+            None,
+            "between two heads"
+        );
+        assert_eq!(
+            c.main_at(t("2026-09-30T00:00:00Z")),
+            None,
+            "before the first sweep"
+        );
+        assert_eq!(
+            passing(c.main_at(t("2026-10-01T03:00:00Z"))),
+            pair("b", &["test"]),
+            "the rerun's result is not dated back"
+        );
+        assert_eq!(
+            c.main_at(t("2026-10-01T03:30:00Z")),
+            None,
+            "between two results"
+        );
+        assert_eq!(
+            passing(c.main_at(t("2026-10-01T04:00:00Z"))),
+            pair("b", &["test", "FreeBSD"])
+        );
+        assert_eq!(
+            passing(c.main_over(t("2026-10-01T00:30:00Z"), t("2026-10-01T01:30:00Z"))),
+            pair("a", &["test"])
+        );
+        assert_eq!(
+            c.main_over(t("2026-10-01T01:00:00Z"), t("2026-10-01T03:00:00Z")),
+            None,
+            "no one entry spans it"
+        );
+        // A sweep with no answer for the branch keeps the history.
+        c.note_main(None, t("2026-10-01T05:00:00Z"));
+        assert_eq!((c.main_checks.as_ref(), c.main_history.len()), (None, 3));
+        // Entries last seen more than a year ago are dropped.
+        c.note_main(Some(main("c", &[])), t("2027-10-03T00:00:00Z"));
+        let oids: Vec<&str> = c.main_history.iter().map(|m| m.oid.as_str()).collect();
+        assert_eq!(oids, ["c"]);
+        for i in 0..MAIN_HISTORY_LEN + 3 {
+            c.note_main(Some(main(&format!("x{i}"), &[])), t("2027-10-04T00:00:00Z"));
+        }
+        assert_eq!(c.main_history.len(), MAIN_HISTORY_LEN);
+        assert_eq!(c.main_history[0].oid, "x3", "the oldest go first");
+    }
+
+    #[test]
     fn merging_a_fetch_keeps_older_timeline_items_and_derived_values() {
         let mut r = PrRecord {
             number: 7,
@@ -560,6 +721,7 @@ mod tests {
                 state: Some(Decision {
                     value: "draft".into(),
                     rule: "isDraft".into(),
+                    subtype: None,
                 }),
                 ..Default::default()
             },
@@ -718,11 +880,16 @@ mod tests {
         assert!(r.stale && r.needs_fetch());
         assert_eq!(r.checks.rollup.as_deref(), Some("FAILURE"));
         // The deep fetch read the names; the next sweep leaves the record alone.
-        r.checks.failing = vec!["test".into()];
+        r.checks.failing = vec!["test".into(), "ci/legacy".into()];
+        r.checks.failing_statuses = Some(vec!["ci/legacy".into()]);
         r.stale = false;
         r.apply_light(&failed, now);
         assert!(!r.needs_fetch());
-        assert_eq!(r.checks.failing, ["test"]);
+        assert_eq!(r.checks.failing, ["test", "ci/legacy"]);
+        assert_eq!(
+            r.checks.failing_statuses,
+            Some(vec!["ci/legacy".to_string()])
+        );
         // Another suite fails too: the rollup stays FAILURE, the suites move.
         let suite = |conclusion: &str| Suite {
             status: "COMPLETED".into(),
@@ -746,6 +913,7 @@ mod tests {
         };
         r.apply_light(&pushed, now);
         assert!(r.checks.failing.is_empty() && r.needs_fetch());
+        assert_eq!(r.checks.failing_statuses, Some(Vec::new()));
     }
 
     #[test]

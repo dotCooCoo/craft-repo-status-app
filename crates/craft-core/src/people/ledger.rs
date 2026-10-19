@@ -393,6 +393,7 @@ mod tests {
                     state: Some(Decision {
                         value: LANDED_ELSEWHERE.into(),
                         rule: "landed".into(),
+                        subtype: None,
                     }),
                     ..Default::default()
                 },
@@ -529,6 +530,7 @@ mod tests {
         declined.derived.state = Some(Decision {
             value: "closed_declined".into(),
             rule: "declined".into(),
+            subtype: None,
         });
         c.records.insert(2, declined);
         // Closed by hand, then reopened and closed by another pull request.

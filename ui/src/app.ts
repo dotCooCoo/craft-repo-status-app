@@ -18,6 +18,10 @@ import type {
 } from './model.ts';
 import { MINE_COLUMNS, heldTip, mineRows, mineValue, myLogin, nextMineSort, replyTip, waitsText } from './model.ts';
 import type { MineRow } from './model.ts';
+import {
+  TRACK_COLUMNS, TRACK_HINT, eventLabel, eventText, levelLabel, levelTip, pctText, peopleModeIn, peopleModeOf, trackBar, trackRows,
+} from './model.ts';
+import type { PeopleMode, TrackEvent, TrackRecord, TrackRow } from './model.ts';
 
 /** What the UI needs from the host: Tauri commands and events, window chrome. */
 export interface Api {
@@ -45,8 +49,10 @@ interface State {
   peopleSort: Sort;
   /** The people whose caret is open. */
   peopleOpen: Set<string>;
-  /** The People tab's sub-view: open work by state, or the rankings. */
-  peopleMode: 'work' | 'rankings';
+  /** The People tab's sub-view: open work by state, the rankings, or the Track record (drawn only while the view carries one). */
+  peopleMode: PeopleMode;
+  /** The Track record rows whose caret is open, as `repo|person`. */
+  trackOpen: Set<string>;
   rankMode: RankMode;
   rankSort: Sort;
   /** The people whose caret is open in the rankings. */
@@ -131,7 +137,8 @@ export function start(api: Api): () => void {
     peopleRepo: '',
     peopleSort: load<Sort>('peopleSort', { key: 'on_them', dir: 'desc' }),
     peopleOpen: new Set(),
-    peopleMode: load<string>('peopleMode', 'work') === 'rankings' ? 'rankings' : 'work',
+    peopleMode: peopleModeIn(load<string>('peopleMode', 'work')),
+    trackOpen: new Set(),
     rankMode: RANK_MODES.find((m) => m.id === load<string>('rankMode', 'merged'))?.id ?? 'merged',
     rankSort: load<Sort>('rankSort', { key: 'merged', dir: 'desc' }),
     rankOpen: new Set(),
@@ -761,8 +768,15 @@ export function start(api: Api): () => void {
       state.peopleRepo = repos.find((r) => r.toLowerCase() === state.peopleRepo.toLowerCase()) ?? '';
     }
     if (sel.value !== state.peopleRepo) sel.value = state.peopleRepo;
-    const ranking = state.peopleMode === 'rankings';
-    document.querySelectorAll<HTMLElement>('#people-view .seg').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.pmode === state.peopleMode)));
+    const mode = peopleModeOf(state.peopleMode, state.people);
+    const ranking = mode === 'rankings';
+    const tracking = mode === 'track';
+    document.querySelectorAll<HTMLElement>('#people-view .seg').forEach((b) => {
+      b.setAttribute('aria-selected', String(b.dataset.pmode === mode));
+      // The Track record button shows only while the config turns it on.
+      if (b.dataset.pmode === 'track') b.hidden = !state.people?.track;
+    });
+    win.hidden = tracking;
     const rankSel = $<HTMLSelectElement>('people-rank');
     if (!rankSel.options.length) rankSel.append(...RANK_MODES.map((m) => el('option', { value: m.id }, m.label)));
     if (rankSel.value !== state.rankMode) rankSel.value = state.rankMode;
@@ -778,9 +792,11 @@ export function start(api: Api): () => void {
     rankSel.hidden = !ranking;
     typeSel.hidden = !ranking || state.rankMode !== 'type';
     const hint = $('people-hint');
-    hint.textContent = ranking
-      ? '? marks a type set by a fallback rule, * an unverified count. Hover a header for what it counts.'
-      : 'Dotted states were read from comment text, not from GitHub fields; ? marks low confidence. Hover a state for its rule and sentence.';
+    hint.textContent = tracking
+      ? TRACK_HINT
+      : ranking
+        ? '? marks a type set by a fallback rule, * an unverified count. Hover a header for what it counts.'
+        : 'Dotted states were read from comment text, not from GitHub fields; ? marks low confidence. Hover a state for its rule and sentence.';
     hint.title = hint.textContent;
     const v = state.people;
     const cached = $('people-cached');
@@ -791,8 +807,8 @@ export function start(api: Api): () => void {
       $('people-main').replaceChildren(el('p', { class: 'empty' }, NO_RECORDS));
       return;
     }
-    if (ranking) {
-      renderRankings(v);
+    if (ranking || (tracking && v.track)) {
+      if (tracking && v.track) renderTrack(v.track); else renderRankings(v);
       if (focused) [...document.querySelectorAll<HTMLElement>('#people-main [data-focus]')].find((n) => n.dataset.focus === focused)?.focus();
       return;
     }
@@ -969,6 +985,108 @@ export function start(api: Api): () => void {
     const needs = mine(state.snap?.repos.map((r) => r.repo) ?? [], true).length;
     $('mine-count').textContent = needs ? String(needs) : '';
     $('mine-count').title = `${needs} of your open pull requests wait on you or for your reply`;
+  }
+
+  // ───────────────────────────── track record ─────────────────────────────
+  // The People tab's Track record view, drawn only while the People view
+  // carries one (`people.track_record` on). One row per person per repo in
+  // the host's order; the viewing user's rows sit apart under You.
+
+  /** A level as a chip whose hover gives its rule and evidence. */
+  function levelChip(r: TrackRow, windowDays: number): HTMLElement {
+    return el('span', { class: `level ${r.level.replace('_', '-')}`, title: levelTip(r, windowDays) }, levelLabel(r.level));
+  }
+
+  /** The fault rate's interval as a band and the baseline as a line, both on one scale. */
+  function rateBar(r: TrackRow): HTMLElement | null {
+    const b = trackBar(r);
+    if (!b || r.low === null || r.high === null) return null;
+    const pos = (x: number) => `${(Math.min(1, x) * 100).toFixed(1)}%`;
+    const tip = `${pctText(r.faults / Math.max(1, r.counted))}, 90% interval ${pctText(r.low)} to ${pctText(r.high)}${r.baseline ? `; baseline ${pctText(r.baseline.rate)}` : ''}. The bar runs from 0 to ${pctText(b.scale)}.`;
+    return el('span', { class: 'rate-bar', title: tip, 'aria-label': tip },
+      el('span', { class: 'rate-band', style: `left: ${pos(b.low)}; width: ${pos(Math.max(0, b.high - b.low))}` }),
+      b.base === null ? null : el('span', { class: 'rate-base', style: `left: ${pos(b.base)}` }));
+  }
+
+  /** One Track record row: the person, the repo, the level and the figures behind it, with a caret that lists every event. */
+  function trackRowEl(r: TrackRow, t: TrackRecord, open: boolean): HTMLTableRowElement {
+    const entry = state.snap?.repos.find((e) => e.repo.toLowerCase() === r.repo.toLowerCase());
+    const openKey = `${r.repo}|${r.key}`;
+    const plain = (n: number) => el('span', { class: n ? '' : 'zero' }, num(n));
+    const cells: Node[] = [
+      el('span', { class: 'person' },
+        el('button', {
+          class: 'caret', 'aria-expanded': String(open),
+          'aria-label': `${open ? 'Hide' : 'Show'} ${r.login}’s track record in ${shortName(r.repo)}`,
+          dataset: { focus: `track-caret:${openKey}` },
+          onclick: () => { if (state.trackOpen.has(openKey)) state.trackOpen.delete(openKey); else state.trackOpen.add(openKey); redrawPeople(); },
+        }, open ? '▾' : '▸'),
+        link(r.login, `https://github.com/${r.login}`, 'who'),
+        r.name ? el('span', { class: 'name', title: r.name }, r.name) : null,
+        r.new_to_repo ? el('span', { class: 'track-tag', title: 'Their first pull request here was their first contribution to the repo.' }, 'new to this repo') : null),
+      el('span', {}, appIcon(entry ?? { repo: r.repo }), ' ', shortName(r.repo)),
+      el('span', {}, levelChip(r, t.window_days),
+        r.recent_fault ? el('span', { class: 'track-tag recent', title: 'A confirmed fault in the last 7 days. It does not change the level.' }, `fault ${r.recent_fault.slice(0, 10)}`) : null),
+      plain(r.counted),
+      plain(r.faults),
+      rateBar(r) ?? el('span', { class: 'zero' }, ''),
+      plain(r.clean),
+      el('span', { class: r.maintainer_commits ? '' : 'zero', title: `${r.maintainer_commits} maintainer commits on ${r.landed} counted landings` }, num(r.maintainer_commits)),
+      plain(r.waiting),
+      plain(r.pending),
+    ];
+    return el('tr', { class: classes('track-row', r.you && 'you'), dataset: { key: r.key, repo: r.repo } }, ...cells.map((c) => el('td', {}, c)));
+  }
+
+  /** One event in a Track record caret: what it is, the pull request, its date, the rule, the other pull request and its tags. */
+  function trackEventLine(e: TrackEvent): HTMLElement {
+    return el('div', { class: classes('track-event', e.fault && 'fault'), title: eventText(e) },
+      el('span', { class: 'kind' }, eventLabel(e.kind)), ' ',
+      link(`#${e.number}`, e.url), ' ', e.title, ' ',
+      el('span', { class: 'muted' }, e.at ? e.at.slice(0, 10) : 'undated'), ' · ', e.rule,
+      e.other ? el('span', {}, ' · ', link(`#${e.other.number}`, e.other.url), e.other.author ? el('span', { class: 'muted' }, ` by ${e.other.author}`) : null) : null,
+      e.involves_you ? el('span', { class: 'track-tag' }, 'involves you') : null,
+      e.ci_did_not_run ? el('span', { class: 'track-tag' }, 'CI did not run') : null);
+  }
+
+  /** The detail under an open Track record row: the level's rule and baseline, the figures, then every fault and every listed event. */
+  function trackDetail(r: TrackRow, t: TrackRecord): HTMLElement {
+    const p = (text: string) => el('p', { class: 'small' }, text);
+    const faults = r.events.filter((e) => e.fault);
+    const listed = r.events.filter((e) => !e.fault);
+    const b = r.baseline;
+    return el('div', { class: 'track-detail' },
+      p(r.rule),
+      b ? p(`The baseline, ${pctText(b.rate)}, pools ${num(b.faults)} faults in ${num(b.counted)} counted pull requests by ${b.authors.join(', ')} (${b.scope === 'repo' ? 'the other authors in this repo' : 'authors across the repos, since this repo has fewer than 5 other authors with a long enough record'}).`) : null,
+      p(`${num(r.prs)} pull requests opened in the last ${t.window_days} days: ${num(r.mature)} at least 7 days old, ${num(r.decided)} of them decided; ${num(r.counted)} counted; ${num(r.waiting)} waiting for review; ${num(r.pending)} merged in the last 72 hours.`),
+      r.ci_ran >= 3 ? p(`Checks ran on ${num(r.ci_ran)} decided pull requests; on ${num(r.ci_own)} a check failed that passed on main when it ran.`) : null,
+      el('h4', {}, `Confirmed faults (${faults.length})`),
+      faults.length ? el('div', {}, faults.map(trackEventLine)) : el('p', { class: 'muted small' }, 'None.'),
+      el('h4', {}, `Listed, not counted (${listed.length})`),
+      listed.length ? el('div', {}, listed.map(trackEventLine)) : el('p', { class: 'muted small' }, 'None.'));
+  }
+
+  /** The Track record view: the rows of the People repo picker's repo in the host's order, the viewing user's rows apart under You. */
+  function renderTrack(t: TrackRecord): void {
+    const span = TRACK_COLUMNS.length;
+    const head = el('tr', { class: 'cols' }, TRACK_COLUMNS.map((c) => el('th', { title: c.title }, c.label)));
+    const body = el('tbody');
+    const add = (r: TrackRow) => {
+      const open = state.trackOpen.has(`${r.repo}|${r.key}`);
+      body.append(trackRowEl(r, t, open));
+      if (open) body.append(el('tr', { class: 'detail', dataset: { key: r.key, repo: r.repo } }, el('td', { colspan: span }, trackDetail(r, t))));
+    };
+    const { rows, you } = trackRows(t, state.peopleRepo);
+    rows.forEach(add);
+    if (you.length) {
+      body.append(el('tr', { class: 'you-head' }, el('td', { colspan: span }, 'You: your own record, outside the order and left out of every baseline')));
+      you.forEach(add);
+    }
+    if (!body.childElementCount) {
+      body.append(el('tr', {}, el('td', { colspan: span, class: 'empty' }, `Nobody outside the maintainers opened a pull request here in the last ${t.window_days} days.`)));
+    }
+    $('people-main').replaceChildren(el('table', { class: 'people-table', id: 'track-table' }, el('thead', {}, head), body),
+      el('p', { class: 'muted small' }, `Pull requests opened in the last ${t.window_days} days. A level never feeds the work states, the rankings or My PRs.`));
   }
 
   // ───────────────────────────── repo carets ─────────────────────────────
@@ -1203,7 +1321,7 @@ export function start(api: Api): () => void {
   });
   $('people-repo').addEventListener('change', (e) => { state.peopleRepo = (e.target as HTMLSelectElement).value; redrawPeople(); });
   document.querySelectorAll<HTMLElement>('#people-view .seg').forEach((b) => b.addEventListener('click', () => {
-    state.peopleMode = b.dataset.pmode === 'rankings' ? 'rankings' : 'work';
+    state.peopleMode = peopleModeIn(b.dataset.pmode);
     save('peopleMode', state.peopleMode);
     redrawPeople();
   }));

@@ -12,6 +12,10 @@ import {
 } from './model.ts';
 import type { Flow, Given, Item, PeopleView, PersonResponse, PersonRow, Rank, RankRow, WorkState } from './model.ts';
 import { blockerOf, heldTip, isHeld, mineRows, mineValue, myLogin, nextMineSort, replyTip, waitsText } from './model.ts';
+import {
+  LEVEL_LABELS, eventLabel, eventText, levelLabel, levelTip, pctText, peopleModeIn, peopleModeOf, trackBar, trackRows,
+} from './model.ts';
+import type { TrackEvent, TrackRecord, TrackRow } from './model.ts';
 
 const entry = (repo: string, stats: Partial<RepoStats> | null, fetched_at: string | null = '2026-10-08T12:00:00Z'): RepoEntry =>
   ({ repo: `o/${repo}`, stats: stats as RepoStats | null, fetched_at });
@@ -519,7 +523,7 @@ test('a repo’s figures group its open work, queues, holds, health and flow', (
     pitem('O/Alpha', 9, 'dee-example', { state: 'ci_failing_inherited_from_main', waits_on: ['ci'], since: hoursAgo(1), competing: [7] }),
   );
   v.repos = { 'o/alpha': { '7d': { merged: 3, merged_by: { batch: 3 }, landed_elsewhere: 0, closed: {}, median_merge_secs: 60, median_response_secs: null, methods: {}, mergers: {} } } };
-  v.main = { 'O/Alpha': { oid: 'h', rollup: 'FAILURE', failing: ['test'] } };
+  v.main = { 'O/Alpha': { oid: 'h', rollup: 'FAILURE', failing: ['test'], passing: [] } };
   const f = repoFigures(v, 'o/ALPHA', '7d', PNOW);
   assert.equal(f.open, 6);
   assert.deepEqual(f.byRole.map((g) => [g.role, g.count]), [['author', 2], ['maintainer', 2], ['owner', 1], ['ci', 1]]);
@@ -600,4 +604,93 @@ test('a blocker names the state in short words and says who it waits on; Held al
   assert.match(replyTip({ at: hoursAgo(5), by: 'maint-one', subtype: 'split_request', url: '' }, PNOW), /^maint-one asked 5h ago \(split request\)/);
   assert.match(heldTip(i(HOLD_WORK), PNOW), /^Held for 4d, by maint-one, reason: brand, held again 1d ago, waits on boss-one\.$/);
   assert.match(heldTip(i({ state: 'author_stepped_back', also: ['held_for_owner'] }), PNOW), /An earlier rule decided the state/);
+});
+
+// ───────────────────────────── track record ─────────────────────────────
+
+const tevent = (number: number, kind: string, fault: boolean, over: Partial<TrackEvent> = {}): TrackEvent => ({
+  kind, fault, number, url: `https://github.com/o/a/pull/${number}`, title: `Change ${number}`, at: '2026-10-01T10:00:00Z',
+  rule: `rule for #${number}`, other: null, involves_you: false, ci_did_not_run: false, ...over,
+});
+
+const trow = (key: string, repo: string, over: Partial<TrackRow> = {}): TrackRow => ({
+  key, login: key, name: null, repo, you: false, new_to_repo: false, level: 'not_enough', rule: `${key} rule`,
+  prs: 6, mature: 6, decided: 6, counted: 5, faults: 0, low: 0, high: 0.351, baseline: null, waiting: 1, pending: 0,
+  clean: 5, landed: 5, maintainer_commits: 0, ci_ran: 0, ci_own: 0, first_activity: null, last_fault: null, recent_fault: null,
+  events: [], ...over,
+});
+
+test('the Track record labels its levels Trusted, Review, Untrusted and Not enough record', () => {
+  assert.deepEqual(LEVEL_LABELS, { untrusted: 'Untrusted', review: 'Review', trusted: 'Trusted', not_enough: 'Not enough record' });
+  assert.equal(levelLabel('review'), 'Review');
+  assert.equal(eventLabel('follow_up'), 'Fixed by someone else');
+  assert.equal(eventLabel('something_new'), 'something new');
+});
+
+test('the Track record view is drawn only while the People view carries one', () => {
+  const track: TrackRecord = { window_days: 60, rows: [] };
+  assert.equal(peopleModeOf('track', { track }), 'track');
+  assert.equal(peopleModeOf('track', { track: null }), 'work', 'the config turned it off');
+  assert.equal(peopleModeOf('track', {}), 'work');
+  assert.equal(peopleModeOf('track', null), 'work');
+  assert.equal(peopleModeOf('rankings', null), 'rankings');
+  assert.equal(peopleModeOf('anything', { track }), 'work');
+  assert.deepEqual(['track', 'rankings', 'work', 'nonsense', undefined].map(peopleModeIn), ['track', 'rankings', 'work', 'work', 'work']);
+});
+
+test('track rows keep the host’s order, filter by repo and set the viewing user apart', () => {
+  const t: TrackRecord = {
+    window_days: 60,
+    rows: [
+      trow('ux-one', 'o/b', { level: 'untrusted' }),
+      trow('rv-one', 'o/a', { level: 'review' }),
+      trow('ok-one', 'o/a', { level: 'trusted' }),
+      trow('new-one', 'o/b'),
+      trow('me-example', 'o/a', { you: true, level: 'trusted' }),
+    ],
+  };
+  const all = trackRows(t, '');
+  assert.deepEqual(all.rows.map((r) => r.key), ['ux-one', 'rv-one', 'ok-one', 'new-one'], 'no reordering');
+  assert.deepEqual(all.you.map((r) => r.key), ['me-example']);
+  assert.deepEqual(trackRows(t, 'O/A').rows.map((r) => r.key), ['rv-one', 'ok-one'], 'a repo in any letter case');
+  assert.deepEqual(trackRows(t, 'o/c'), { rows: [], you: [] });
+});
+
+test('a level’s hover gives its rule, the baseline’s authors and every counted fault with the rule that matched', () => {
+  const r = trow('ux-one', 'o/a', {
+    level: 'untrusted', rule: 'Untrusted: 2 of 5 counted pull requests had a confirmed fault.', faults: 2, waiting: 3, pending: 1, prs: 9,
+    baseline: { rate: 0.05, faults: 1, counted: 20, scope: 'repo', authors: ['peer-a', 'peer-b'] },
+    events: [
+      tevent(4, 'revert', true, { other: { number: 9, url: 'u', title: 'Revert', author: 'me-example' }, involves_you: true }),
+      tevent(5, 'checklist', true, { ci_did_not_run: true }),
+      tevent(6, 'possible_follow_up', false),
+    ],
+  });
+  const tip = levelTip(r, 60).split('\n');
+  assert.deepEqual(tip, [
+    'Untrusted: 2 of 5 counted pull requests had a confirmed fault.',
+    'Baseline authors: peer-a, peer-b.',
+    '5 counted of 9 opened in the last 60 days; 3 waiting for review, 1 merged in the last 72 hours.',
+    'Confirmed faults:',
+    '#4 Reverted (#9 by me-example), 2026-10-01: rule for #4 [involves you]',
+    '#5 Gate box ticked over a failing check, 2026-10-01: rule for #5 [CI did not run]',
+  ], 'listed events stay out of the hover');
+  assert.equal(eventText(tevent(7, 'close', false, { at: null })), '#7 Closed, undated: rule for #7');
+  assert.match(levelTip(trow('ok', 'o/a'), 30), /No confirmed fault\./);
+});
+
+test('the rate bar puts the interval and the baseline on one scale, and rates read as percentages', () => {
+  const r = trow('a', 'o/a', { level: 'review', low: 0.143, high: 0.728, baseline: { rate: 0.05, faults: 1, counted: 20, scope: 'all', authors: [] } });
+  const b = trackBar(r)!;
+  const near = (a: number, want: number) => assert.ok(Math.abs(a - want) < 1e-9, `${a} is not ${want}`);
+  near(b.scale, 0.91);
+  near(b.high, 0.8);
+  near(b.base!, 0.05 / 0.91);
+  const small = trackBar(trow('b', 'o/a', { level: 'trusted', low: 0, high: 0.02, baseline: null }))!;
+  assert.equal(small.scale, 0.125, 'at least a tenth, plus room');
+  assert.equal(small.base, null);
+  assert.equal(trackBar(trow('c', 'o/a', { level: 'review', low: null, high: null })), null, 'nothing counted');
+  assert.equal(trackBar(trow('d', 'o/a', { level: 'untrusted', low: 0.5, high: 0.95 }))!.scale, 1, 'never past 100%');
+  assert.equal(trackBar(trow('e', 'o/a', { counted: 3, faults: 1, low: 0.078, high: 0.746 })), null, 'Not enough record shows no rate');
+  assert.deepEqual([pctText(0.05), pctText(0.004), pctText(0), pctText(0.3512)], ['5%', '0.4%', '0%', '35%']);
 });

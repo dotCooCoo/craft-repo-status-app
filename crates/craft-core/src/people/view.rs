@@ -13,6 +13,7 @@ use super::rank::{Direct, RankInput, RankRow, Rankings};
 use super::record::{Decision, MainChecks, PrCache, PrState};
 use super::roster::RosterRow;
 use super::states::{self, Ctx, MergeAt, WorkState};
+use super::track::TrackRecord;
 use super::{canonical, directory, is_bot, maintainers, Directory, RepoPeople};
 use crate::config::PeopleConfig;
 use crate::model::{Time, ALL_TIME, SINCE_RELEASE, WINDOWS};
@@ -101,6 +102,7 @@ pub fn assemble(
                 r.derived.state = Some(Decision {
                     value: ws.state.clone(),
                     rule: ws.rule.clone(),
+                    subtype: ws.subtype.clone(),
                 });
             }
         }
@@ -332,7 +334,7 @@ pub struct PersonRow {
 }
 
 /// Everything the People tab shows.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PeopleView {
     pub generated_at: Option<Time>,
@@ -364,6 +366,9 @@ pub struct PeopleView {
     /// `people.my_login` from the config, which the My PRs tab lists in
     /// place of `viewer`.
     pub my_login: Option<String>,
+    /// The Track record view; `None` unless the config turns it on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track: Option<TrackRecord>,
 }
 
 /// The start of each window for `repo`; a repository without a build has
@@ -841,6 +846,8 @@ mod tests {
             oid: "head".into(),
             rollup: Some("SUCCESS".into()),
             failing: vec![],
+            passing: vec![],
+            ..Default::default()
         });
         let maintainers: BTreeSet<String> = ["maint-one".to_string()].into();
         let owners = vec!["boss-one".to_string()];
@@ -1009,6 +1016,13 @@ mod tests {
         let rec = &caches[0].1.records[&2];
         assert_eq!(rec.derived.kind.as_ref().unwrap().value, "docs");
         assert_eq!(rec.derived.area.as_ref().unwrap().value, "docs");
+        // The work state's subtype is kept with it, for the Track record.
+        let state = caches[0].1.records[&3].derived.state.clone().unwrap();
+        assert_eq!(
+            (state.value.as_str(), state.subtype.is_some()),
+            ("closed_withdrawn_or_abandoned", true),
+            "{state:?}"
+        );
         assert_eq!(rk.credits.len(), 1);
         assert_eq!(
             (v.my_login, v.viewer),

@@ -11,6 +11,7 @@ import { COLUMNS } from './model.ts';
 import type { Meta, RepoEntry, RepoStats, Snapshot, UrgentIssue } from './model.ts';
 import { BATCH_TIP, NOT_READ_YET, PRODUCT, RANK_COLUMNS, UNVERIFIED_TIP, rankRows } from './model.ts';
 import type { DetailRow, Flow, Item, PeopleView, PersonDetail, PersonRow, Rank, RankRow, RepoPeople, WorkState } from './model.ts';
+import type { TrackEvent, TrackRow } from './model.ts';
 
 const HTML = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const BODY = HTML.match(/<body>([\s\S]*)<\/body>/)![1]!.replace(/<script[\s\S]*?<\/script>/g, '');
@@ -409,7 +410,7 @@ const people = (): PeopleView => ({
       },
     },
   },
-  main: { 'o/alpha': { oid: 'head', rollup: 'FAILURE', failing: ['test'] } },
+  main: { 'o/alpha': { oid: 'head', rollup: 'FAILURE', failing: ['test'], passing: [] } },
   items: [
     prItem('alpha', 1, 'ann-example', {
       state: 'held_for_owner', waits_on: ['owner'], waits_for: ['boss-one'], since: hoursBack(96), guess: true,
@@ -936,4 +937,111 @@ test('My PRs says when there are no records or no login yet, and redraws for a n
   h.emit('craft:snapshot', snapshot([repo('beta', {})]));
   assert.deepEqual(mineKeys(h), ['o/beta#3'], 'a repo left the list');
   assert.equal(h.doc.getElementById('mine-count')!.textContent, '1');
+});
+
+// ───────────────────────────── track record ─────────────────────────────
+
+const trackRow = (key: string, repo: string, over: Partial<TrackRow> = {}): TrackRow => ({
+  key, login: key, name: null, repo, you: false, new_to_repo: false, level: 'not_enough', rule: `${key}: rule`,
+  prs: 6, mature: 6, decided: 6, counted: 5, faults: 0, low: 0, high: 0.351, baseline: null, waiting: 1, pending: 0,
+  clean: 5, landed: 5, maintainer_commits: 0, ci_ran: 0, ci_own: 0, first_activity: null, last_fault: null, recent_fault: null,
+  events: [], ...over,
+});
+const trackEvent = (number: number, kind: string, fault: boolean, over: Partial<TrackEvent> = {}): TrackEvent => ({
+  kind, fault, number, url: `https://github.com/o/beta/pull/${number}`, title: `Change ${number}`, at: '2026-10-10T00:00:00Z',
+  rule: `rule for #${number}`, other: null, involves_you: false, ci_did_not_run: false, ...over,
+});
+const trackView = (): PeopleView => ({
+  ...people(),
+  track: {
+    window_days: 60,
+    rows: [
+      trackRow('ux-one', 'o/beta', {
+        level: 'untrusted', rule: 'Untrusted: 2 of 5 counted pull requests had a confirmed fault.', faults: 2, low: 0.14, high: 0.73,
+        baseline: { rate: 0.05, faults: 1, counted: 20, scope: 'repo', authors: ['peer-a', 'peer-b'] }, recent_fault: '2026-10-15T00:00:00Z',
+        events: [
+          trackEvent(4, 'revert', true, { other: { number: 9, url: 'https://github.com/o/beta/pull/9', title: 'Revert', author: 'maint-one' } }),
+          trackEvent(6, 'possible_follow_up', false),
+        ],
+      }),
+      trackRow('ann-example', 'o/alpha', { login: 'Ann-Example', name: 'Ann', level: 'trusted', new_to_repo: true }),
+      trackRow('bo-example', 'o/beta', { counted: 3, faults: 1, low: 0.078, high: 0.746 }),
+      trackRow('me-example', 'o/alpha', { you: true, level: 'review' }),
+    ],
+  },
+});
+const trackKeys = (h: Harness) => [...h.doc.querySelectorAll<HTMLElement>('#track-table tr.track-row')].map((r) => r.dataset.key);
+const trackSeg = (h: Harness) => h.doc.querySelector<HTMLElement>('#people-view .seg[data-pmode="track"]')!;
+
+test('the Track record button shows only while the People view carries a Track record', async () => {
+  const h = await peopleSetup();
+  assert.equal(trackSeg(h).hidden, true, 'off in the config: no button');
+  assert.equal(h.doc.getElementById('track-table'), null);
+  h.emit('craft:people', trackView());
+  assert.equal(trackSeg(h).hidden, false);
+});
+
+test('a Track record chosen earlier waits for a People view that carries one', async () => {
+  const off = await setup({ storage: { peopleMode: 'track' }, host: (cmd) => (cmd === 'get_people' ? people() : undefined) });
+  keydown(off, '4', true);
+  assert.equal(trackSeg(off).hidden, true);
+  assert.ok(off.doc.getElementById('people-table'), 'the Work view instead');
+  assert.equal(off.doc.querySelector('#people-view .seg[data-pmode="work"]')!.getAttribute('aria-selected'), 'true');
+});
+
+test('the Track record lists rows in the host’s order with the viewer apart, and each level’s evidence', async () => {
+  const h = await peopleSetup(trackView());
+  trackSeg(h).click();
+  assert.equal(stored(h, 'peopleMode'), 'track');
+  assert.deepEqual(trackKeys(h), ['ux-one', 'ann-example', 'bo-example', 'me-example']);
+  const rows = [...h.doc.querySelectorAll<HTMLElement>('#track-table tbody tr')];
+  assert.equal(rows[3]!.className, 'you-head', 'the viewer’s row comes after a You heading');
+  assert.match(rows[3]!.textContent!, /You: your own record/);
+  assert.equal((h.doc.getElementById('people-window') as HTMLElement).hidden, true, 'the Track record has its own window');
+  assert.equal((h.doc.getElementById('people-repo') as HTMLElement).hidden, false);
+  assert.match(h.doc.getElementById('people-hint')!.textContent!, /confirmed faults read from GitHub fields/);
+  const heads = [...h.doc.querySelectorAll<HTMLElement>('#track-table th')];
+  assert.deepEqual(heads.map((th) => th.textContent), ['Person', 'Repo', 'Level', 'Counted', 'Faults', 'Rate', 'Clean merges', 'Maint. commits', 'Waiting', 'Pending']);
+  heads.find((th) => th.textContent === 'Faults')!.click();
+  assert.deepEqual(trackKeys(h), ['ux-one', 'ann-example', 'bo-example', 'me-example'], 'no header reorders the rows');
+  const ux = h.doc.querySelector<HTMLTableRowElement>('#track-table tr.track-row[data-key="ux-one"]')!;
+  const chip = ux.querySelector<HTMLElement>('.level')!;
+  assert.equal(chip.textContent, 'Untrusted');
+  assert.match(chip.title, /^Untrusted: 2 of 5/);
+  assert.match(chip.title, /#4 Reverted \(#9 by maint-one\), 2026-10-10: rule for #4/);
+  assert.match(ux.cells[2]!.textContent!, /fault 2026-10-15/, 'a recent fault shows a dated badge');
+  assert.ok(ux.querySelector('.rate-bar .rate-band') && ux.querySelector('.rate-bar .rate-base'));
+  assert.match(h.doc.querySelector('#track-table tr.track-row[data-key="ann-example"]')!.textContent!, /new to this repo/);
+  assert.equal(h.doc.querySelector('#track-table tr.track-row[data-key="bo-example"] .rate-bar'), null, 'Not enough record shows no rate');
+  assert.ok(h.doc.querySelector('#track-table tr.track-row[data-key="ann-example"] .rate-bar'), 'a level shows its rate');
+  pick(h, 'people-repo', 'o/alpha');
+  assert.deepEqual(trackKeys(h), ['ann-example', 'me-example'], 'the repo picker');
+  pick(h, 'people-repo', '');
+  // The config turns it off: the Work view comes back, and the choice stays.
+  h.emit('craft:people', people());
+  assert.equal(trackSeg(h).hidden, true);
+  assert.ok(h.doc.getElementById('people-table'));
+  assert.equal((h.doc.getElementById('people-window') as HTMLElement).hidden, false, 'the Work view’s window picker is back');
+  assert.equal(stored(h, 'peopleMode'), 'track');
+});
+
+test('a Track record caret lists every fault and listed event with links, and keeps its focus and table through the clock', async () => {
+  const h = await peopleSetup(trackView());
+  trackSeg(h).click();
+  const caretOf = () => h.doc.querySelector<HTMLButtonElement>('#track-table tr.track-row[data-key="ux-one"] .caret')!;
+  caretOf().focus();
+  caretOf().click();
+  const open = h.doc.querySelector<HTMLElement>('#track-table tr.detail[data-key="ux-one"]')!;
+  assert.deepEqual([...open.querySelectorAll('h4')].map((n) => n.textContent), ['Confirmed faults (1)', 'Listed, not counted (1)']);
+  assert.match(open.textContent!, /pools 1 faults in 20 counted pull requests by peer-a, peer-b/);
+  const links = [...open.querySelectorAll<HTMLElement>('.track-event.fault .link')];
+  assert.deepEqual(links.map((l) => l.textContent), ['#4', '#9']);
+  links[1]!.click();
+  assert.deepEqual(h.calls.at(-1), { cmd: 'open_url', args: { url: 'https://github.com/o/beta/pull/9' } });
+  const table = h.doc.getElementById('track-table');
+  h.emit('craft:snapshot', snapshot());
+  assert.ok(h.doc.getElementById('track-table') === table, 'a snapshot leaves the table alone');
+  h.emit('craft:people', trackView());
+  assert.equal((h.doc.activeElement as HTMLElement).dataset.focus, 'track-caret:o/beta|ux-one');
+  assert.ok(h.doc.querySelector('#track-table tr.detail[data-key="ux-one"]'), 'still open after a new view');
 });

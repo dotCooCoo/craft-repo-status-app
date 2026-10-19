@@ -27,6 +27,7 @@ use craft_core::people::ledger::Ledger;
 use craft_core::people::rank::{direct, Direct, PersonDetail, Rankings, RepoPeople};
 use craft_core::people::record::PrCache;
 use craft_core::people::roster::{self, RosterRow};
+use craft_core::people::track;
 use craft_core::people::view::{assemble, PeopleView};
 use craft_core::people::Directory;
 use craft_core::{Cache, Config, Schedule, Snapshot, TokenStatus, WindowState};
@@ -921,7 +922,9 @@ fn update_people(
 /// from the snapshot and its commits outside pull requests from the
 /// activity kept in `dir` ([`direct_of`]), keeps both and sends the view to
 /// the window. The view carries `viewer`, the token user's login, for the
-/// My PRs tab. Returns the directory of people.
+/// My PRs tab. With `people.track_record` on, it also carries the Track
+/// record ([`track::for_config`]), whose viewing user is `people.my_login`
+/// or else `viewer`. Returns the directory of people.
 fn publish_people(
     app: &AppHandle,
     caches: &mut [(String, PrCache)],
@@ -962,11 +965,19 @@ fn publish_people(
         now,
     );
     view.viewer = viewer.map(str::to_string);
+    let you = track_viewer(cfg, viewer);
+    view.track = track::for_config(caches, &cfg.people, &people, you.as_deref(), now);
     let view = Arc::new(view);
     *state.people.lock().unwrap() = Some(view.clone());
     *state.rankings.lock().unwrap() = Some(Arc::new(rankings));
     let _ = app.emit(EV_PEOPLE, &*view);
     people
+}
+
+/// The Track record's viewing user: `people.my_login`, or else `viewer`,
+/// the token user's login.
+fn track_viewer(cfg: &Config, viewer: Option<&str>) -> Option<String> {
+    cfg.people.my_login().or_else(|| viewer.map(str::to_string))
 }
 
 /// A repo's commits outside pull requests: the commits on its default
@@ -1516,6 +1527,21 @@ mod tests {
             Some("Bo-Example")
         );
         assert_eq!(asked.get(), 3, "a failed query is asked again");
+    }
+
+    #[test]
+    fn the_track_records_viewing_user_is_my_login_or_else_the_token_user() {
+        let mut cfg = Config::default();
+        assert_eq!(track_viewer(&cfg, None), None);
+        assert_eq!(
+            track_viewer(&cfg, Some("Ann-Example")).as_deref(),
+            Some("Ann-Example")
+        );
+        cfg.people.my_login = "Bo-Example".into();
+        assert_eq!(
+            track_viewer(&cfg, Some("Ann-Example")).as_deref(),
+            Some("Bo-Example")
+        );
     }
 
     #[test]

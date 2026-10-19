@@ -72,6 +72,19 @@ batch_repos = ["storytold/designcraft", "storytold/deckcraft"]
 # The GitHub login whose open pull requests the My PRs tab lists. Leave empty
 # for the user the GitHub token belongs to.
 my_login = ""
+# Show the Track record view in the People tab: a review level for each
+# contributor in each repo (Trusted, Review, Untrusted or Not enough record),
+# set only by confirmed faults read from GitHub fields.
+track_record = false
+# How far back the Track record reads, in days by opening date (14 to 365).
+track_record_window_days = 60
+# Checks whose failures never count as a pull request's own in the Track
+# record, by repo, such as { "storytold/vectorcraft" = ["FreeBSD"] }.
+flaky_checks = {}
+# Terms that mark a failure outside a repo's gate, by repo. In the Track
+# record, a sentence about a pull request that names one is not read as naming
+# a defect.
+gate_excluded_terms = { "storytold/vectorcraft" = ["wasm32 clippy"] }
 
 # Owners of one repo, in place of owner_logins:
 # [people.repo_owners]

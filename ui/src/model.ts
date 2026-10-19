@@ -510,6 +510,8 @@ export interface PeopleView {
   viewer?: string | null;
   /** `people.my_login` from the config, which My PRs lists in place of `viewer`. */
   my_login?: string | null;
+  /** The Track record view; absent unless `people.track_record` is on. */
+  track?: TrackRecord | null;
 }
 
 /** How far the first load of merged and closed pull requests has come: `Load` in view.rs. */
@@ -537,8 +539,9 @@ export interface RepoFlow {
   mergers: Record<string, number>;
 }
 
-/** `MainChecks` in record.rs. */
-export interface MainChecks { oid: string; rollup: string | null; failing: string[] }
+/** `MainChecks` in record.rs. `passing` is empty in records kept before it was read; the first and last sweep that saw
+ * the commit come only in a repo's history, never in the view. */
+export interface MainChecks { oid: string; rollup: string | null; failing: string[]; passing: string[]; first_seen?: Time; last_seen?: Time }
 
 // The rankings: mirrors crates/craft-core/src/people/rank.rs.
 
@@ -1358,3 +1361,173 @@ export function heldTip(i: Item, now: number = Date.now()): string {
     h.reaffirmed && `held again ${agoText(h.reaffirmed, now)}`, h.owners.length ? `waits on ${h.owners.join(', ')}` : ''];
   return bits.filter(Boolean).join(', ') + '.';
 }
+
+// ───────────────────────────── track record ─────────────────────────────
+// The Track record view lists one row per person per repo with a review
+// level from confirmed faults: mirrors crates/craft-core/src/people/track.rs.
+// The rows come in the host's order; the view adds no ranking of its own.
+
+/** A review level: `Level` in track.rs, in the order the view lists the groups. */
+export type Level = 'untrusted' | 'review' | 'trusted' | 'not_enough';
+
+/** Another pull request an event names: `TrackLink` in track.rs. */
+export interface TrackLink { number: number; url: string; title: string; author: string | null }
+
+/** One event on a person's pull request: `TrackEvent` in track.rs. */
+export interface TrackEvent {
+  /** revert, follow_up, checklist, declined and duplicate are faults; the others are listed only. */
+  kind: string;
+  /** It counts toward the fault rate. */
+  fault: boolean;
+  number: number;
+  url: string;
+  title: string;
+  at: Time | null;
+  rule: string;
+  other: TrackLink | null;
+  involves_you: boolean;
+  ci_did_not_run: boolean;
+}
+
+/** The fault rate a level is measured against: `Baseline` in track.rs. */
+export interface Baseline {
+  rate: number;
+  faults: number;
+  counted: number;
+  /** 'repo' for the repo's own authors, 'all' for every repo's. */
+  scope: string;
+  authors: string[];
+}
+
+/** One person in one repo: `TrackRow` in track.rs. */
+export interface TrackRow {
+  key: string;
+  login: string;
+  name: string | null;
+  repo: string;
+  you: boolean;
+  new_to_repo: boolean;
+  level: Level;
+  rule: string;
+  prs: number;
+  mature: number;
+  decided: number;
+  counted: number;
+  faults: number;
+  low: number | null;
+  high: number | null;
+  baseline: Baseline | null;
+  waiting: number;
+  pending: number;
+  clean: number;
+  landed: number;
+  maintainer_commits: number;
+  ci_ran: number;
+  ci_own: number;
+  first_activity: Time | null;
+  last_fault: Time | null;
+  recent_fault: Time | null;
+  events: TrackEvent[];
+}
+
+/** The Track record view: `TrackRecord` in track.rs. Rows come in the view's order, the viewing user's last. */
+export interface TrackRecord { window_days: number; rows: TrackRow[] }
+
+/** The People tab's sub-views. */
+export type PeopleMode = 'work' | 'rankings' | 'track';
+
+/** The sub-view a tab button or the saved mode names: the Track record or the rankings, otherwise the work. */
+export const peopleModeIn = (mode: string | null | undefined): PeopleMode => (mode === 'rankings' || mode === 'track' ? mode : 'work');
+
+/** The sub-view to draw for a saved `mode`: the Track record only while the view carries one. */
+export function peopleModeOf(mode: string, view: Pick<PeopleView, 'track'> | null): PeopleMode {
+  if (mode === 'rankings') return 'rankings';
+  if (mode === 'track' && view?.track) return 'track';
+  return 'work';
+}
+
+/** The labels of the levels: `Level::label` in track.rs. */
+export const LEVEL_LABELS: Readonly<Record<Level, string>> = {
+  untrusted: 'Untrusted',
+  review: 'Review',
+  trusted: 'Trusted',
+  not_enough: 'Not enough record',
+};
+export const levelLabel = (l: Level): string => LEVEL_LABELS[l] ?? l;
+
+/** What each kind of event is, in words. */
+export const EVENT_LABELS: Readonly<Record<string, string>> = {
+  revert: 'Reverted',
+  follow_up: 'Fixed by someone else',
+  checklist: 'Gate box ticked over a failing check',
+  declined: 'Closed by a maintainer, landed nowhere',
+  duplicate: 'Late duplicate',
+  process_revert: 'Revert that does not count',
+  possible_follow_up: 'Possible follow-up',
+  maintainer_revision: 'Maintainer revision',
+  found_by_you: 'Follow-up you wrote',
+  precedent: 'Cited as a precedent',
+  close: 'Closed',
+};
+export const eventLabel = (kind: string): string => EVENT_LABELS[kind] ?? kind.replaceAll('_', ' ');
+
+/** A rate as a percentage: one decimal below 1%, whole numbers otherwise; as `pct` in track.rs. */
+export function pctText(x: number): string {
+  const p = x * 100;
+  return p > 0 && p < 1 ? `${p.toFixed(1)}%` : `${Math.round(p)}%`;
+}
+
+/** A date as YYYY-MM-DD, which no clock tick changes. */
+const dayText = (iso: Time | null | undefined): string => (iso ? iso.slice(0, 10) : 'undated');
+
+/** One event as a line of text: what it is, the pull request, its date and the rule. */
+export function eventText(e: TrackEvent): string {
+  const other = e.other ? ` (#${e.other.number}${e.other.author ? ` by ${e.other.author}` : ''})` : '';
+  const tags = [e.involves_you && 'involves you', e.ci_did_not_run && 'CI did not run'].filter(Boolean).join(', ');
+  return `#${e.number} ${eventLabel(e.kind)}${other}, ${dayText(e.at)}: ${e.rule}${tags ? ` [${tags}]` : ''}`;
+}
+
+/** The hover text of a level: its rule, the baseline's authors and every counted fault with the rule that matched. */
+export function levelTip(r: TrackRow, windowDays: number): string {
+  const faults = r.events.filter((e) => e.fault);
+  return [
+    r.rule,
+    r.baseline ? `Baseline authors: ${r.baseline.authors.join(', ')}.` : '',
+    `${r.counted} counted of ${r.prs} opened in the last ${windowDays} days; ${r.waiting} waiting for review, ${r.pending} merged in the last 72 hours.`,
+    faults.length ? 'Confirmed faults:' : 'No confirmed fault.',
+    ...faults.map(eventText),
+  ].filter(Boolean).join('\n');
+}
+
+/** The rows of `repo` ('' for every repo, any letter case), in the host's order, the viewing user's apart. */
+export function trackRows(t: TrackRecord, repo: string): { rows: TrackRow[]; you: TrackRow[] } {
+  const picked = t.rows.filter((r) => !repo || r.repo.toLowerCase() === repo.toLowerCase());
+  return { rows: picked.filter((r) => !r.you), you: picked.filter((r) => r.you) };
+}
+
+/** Where a row's interval and the baseline sit on its bar, as shares of the bar's width; null with nothing counted, and
+ * for Not enough record, which shows no rate. */
+export function trackBar(r: TrackRow): { scale: number; low: number; high: number; base: number | null } | null {
+  if (r.level === 'not_enough' || r.low === null || r.high === null) return null;
+  const base = r.baseline?.rate ?? null;
+  const scale = Math.min(1, Math.max(0.1, r.high, base ?? 0) * 1.25);
+  return { scale, low: r.low / scale, high: r.high / scale, base: base === null ? null : base / scale };
+}
+
+export interface TrackColumn { key: string; label: string; title: string }
+
+/** The Track record's columns. The headers do not sort: the host's order stands. */
+export const TRACK_COLUMNS: readonly TrackColumn[] = [
+  { key: 'person', label: 'Person', title: 'Hover a level for its evidence; the caret lists every event.' },
+  { key: 'repo', label: 'Repo', title: 'Each level comes from the person’s pull requests in this repo alone.' },
+  { key: 'level', label: 'Level', title: 'Untrusted: the fault rate’s 90% interval lies above the baseline’s own 90% interval. Trusted: at or below the baseline, with no fault in 30 days. Review: neither. Not enough record: fewer than 5 counted pull requests, under 80% of the week-old ones decided, or no baseline.' },
+  { key: 'counted', label: 'Counted', title: 'Pull requests at least 7 days old that landed more than 72 hours ago, or that closed as a maintainer’s decline or a late duplicate.' },
+  { key: 'faults', label: 'Faults', title: 'Confirmed faults, one per pull request: a revert, a gate box ticked over a failing check, a maintainer close where the work landed nowhere, or a late duplicate. A follow-up fix by someone else is listed but not counted, since the records do not show the changed lines.' },
+  { key: 'rate', label: 'Rate', title: 'The fault rate’s 90% interval (the band) against the baseline (the line).' },
+  { key: 'clean', label: 'Clean merges', title: 'Counted landings with no fault and no maintainer commit.' },
+  { key: 'maintainer_commits', label: 'Maint. commits', title: 'Commits maintainers pushed to the counted landings. Shown only: it does not set the level.' },
+  { key: 'waiting', label: 'Waiting', title: 'Open pull requests.' },
+  { key: 'pending', label: 'Pending', title: 'Merged in the last 72 hours: too recent to count.' },
+];
+
+export const TRACK_HINT = 'Levels come only from confirmed faults read from GitHub fields, per repo; hover a level for its evidence. No other view reads them.';

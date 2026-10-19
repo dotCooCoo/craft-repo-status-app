@@ -50,7 +50,7 @@ use craft_core::people::record::{
     PrCommit, PrRecord, PrState, Suite, TimelineItem,
 };
 use craft_core::people::roster::Fetched;
-use craft_core::people::{is_merge_commit, merger, parse_co_authors};
+use craft_core::people::{is_merge_commit, merger, parse_co_authors, parse_reverts};
 use serde_json::{json, Value};
 
 use crate::{
@@ -222,6 +222,8 @@ pub fn sweep_pick(
 struct Pass<'a> {
     gh: &'a GitHub,
     now: DateTime<Utc>,
+    /// When the call started, `now` on the clock [`Pass::clock`] reads.
+    started: std::time::Instant,
     floor: u64,
     /// Requests the call may still send, of every kind.
     left: AtomicUsize,
@@ -234,6 +236,7 @@ impl<'a> Pass<'a> {
         Pass {
             gh,
             now,
+            started: std::time::Instant::now(),
             floor,
             left: AtomicUsize::new(max_requests),
             report: Mutex::new(PrReport::default()),
@@ -243,6 +246,12 @@ impl<'a> Pass<'a> {
 
     fn report(&self) -> PrReport {
         self.report.lock().unwrap().clone()
+    }
+
+    /// The time now: `now` plus the time since the call started. The sweep
+    /// dates what a response shows by this time.
+    fn clock(&self) -> DateTime<Utc> {
+        self.now + chrono::Duration::from_std(self.started.elapsed()).unwrap_or_default()
     }
 
     fn update(&self, f: impl FnOnce(&mut PrReport)) {
@@ -561,7 +570,7 @@ impl<'a> Pass<'a> {
             let v = self.repo_query(SWEEP_QUERY, repo, vars)?;
             let r = &v["repository"];
             if page == 0 {
-                cache.main_checks = parse_main(&r["defaultBranchRef"]["target"]);
+                cache.note_main(parse_main(&r["defaultBranchRef"]["target"]), self.clock());
                 if let Some(me) = login(&v["viewer"]) {
                     self.update(|r| r.viewer = Some(me));
                 }
@@ -1087,19 +1096,39 @@ fn parse_suites(conn: &Value) -> Vec<Suite> {
         .collect()
 }
 
+/// The conclusions and states of a failed check.
+const FAILED: &[&str] = &["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE"];
+
 /// The names of the failing checks in a `statusCheckRollup`.
 fn failing_checks(rollup: &Value) -> Vec<String> {
+    checks_with(rollup, FAILED, |_| true)
+}
+
+/// The names of the failing commit statuses (status contexts) in a
+/// `statusCheckRollup`.
+fn failing_statuses(rollup: &Value) -> Vec<String> {
+    checks_with(rollup, FAILED, |c| {
+        c["__typename"].as_str() != Some("CheckRun")
+    })
+}
+
+/// The names of the checks in a `statusCheckRollup` that `keep` accepts and
+/// whose conclusion (a check run's) or state (a status context's) is one of
+/// `outcomes`.
+fn checks_with(rollup: &Value, outcomes: &[&str], keep: impl Fn(&Value) -> bool) -> Vec<String> {
     let mut out = Vec::new();
-    for c in rollup["contexts"]["nodes"].as_array().into_iter().flatten() {
+    for c in rollup["contexts"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| keep(c))
+    {
         let (name, outcome) = match c["__typename"].as_str() {
             Some("CheckRun") => (&c["name"], &c["conclusion"]),
             _ => (&c["context"], &c["state"]),
         };
-        let failed = matches!(
-            outcome.as_str(),
-            Some("FAILURE" | "ERROR" | "TIMED_OUT" | "STARTUP_FAILURE")
-        );
-        if let (true, Some(name)) = (failed, name.as_str()) {
+        let hit = outcome.as_str().is_some_and(|o| outcomes.contains(&o));
+        if let (true, Some(name)) = (hit, name.as_str()) {
             if !out.iter().any(|n| n == name) {
                 out.push(name.to_string());
             }
@@ -1116,6 +1145,14 @@ fn parse_main(target: &Value) -> Option<MainChecks> {
         oid: oid.to_string(),
         rollup: rollup["state"].as_str().map(str::to_string),
         failing: failing_checks(rollup),
+        // With more checks than one page holds, a failure under a passing
+        // check's name may be unread, so no check is kept as passing.
+        passing: if rollup["contexts"]["pageInfo"]["hasNextPage"].as_bool() == Some(true) {
+            Vec::new()
+        } else {
+            checks_with(rollup, &["SUCCESS"], |_| true)
+        },
+        ..Default::default()
     })
 }
 
@@ -1139,6 +1176,7 @@ pub fn parse_light(v: &Value) -> Option<Light> {
             .as_str()
             .map(str::to_string),
         suites: parse_suites(&commit["checkSuites"]),
+        suites_total: commit["checkSuites"]["totalCount"].as_u64(),
     })
 }
 
@@ -1170,8 +1208,9 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
                 author: login(&c["author"]["user"]),
                 author_email: string(&c["author"]["email"]).to_lowercase(),
                 is_merge: is_merge_commit(&headline, adds, additions),
-                headline,
                 co_authors: parse_co_authors(c["message"].as_str().unwrap_or_default()),
+                reverts: parse_reverts(&headline, c["message"].as_str().unwrap_or_default()),
+                headline,
             }
         })
         .collect();
@@ -1249,7 +1288,9 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
     rec.checks.merge_state = string(&v["mergeStateStatus"]);
     rec.checks.rollup = rollup["state"].as_str().map(str::to_string);
     rec.checks.failing = failing_checks(rollup);
+    rec.checks.failing_statuses = Some(failing_statuses(rollup));
     rec.checks.suites = parse_suites(&head["checkSuites"]);
+    rec.checks.suites_total = head["checkSuites"]["totalCount"].as_u64();
     Some(rec)
 }
 
@@ -1363,12 +1404,12 @@ query($ids: [ID!]!, $tl: Int!) {
 const SWEEP_QUERY: &str = r#"
 query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
-    defaultBranchRef { target { ... on Commit { oid statusCheckRollup { state contexts(first: 30) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
+    defaultBranchRef { target { ... on Commit { oid statusCheckRollup { state contexts(first: 30) { pageInfo { hasNextPage } nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
     pullRequests(states: OPEN, first: 100, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
       totalCount pageInfo { hasNextPage endCursor }
       nodes { id number title author { __typename login } updatedAt isDraft headRefOid mergeable mergeStateStatus maintainerCanModify
         comments { totalCount } reviews { totalCount }
-        commits(last: 1) { nodes { commit { statusCheckRollup { state } checkSuites(first: 8) { nodes { status conclusion createdAt app { slug } } } } } } }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } checkSuites(first: 8) { totalCount nodes { status conclusion createdAt app { slug } } } } } } }
     }
   }
   viewer { login }
@@ -1401,7 +1442,7 @@ fragment R on PullRequest {
     messageHeadline message author { email name user { login } } } } }
   head: commits(last: 1) { nodes { commit { oid
     statusCheckRollup { state contexts(first: 20) { nodes { __typename ... on CheckRun { name conclusion status } ... on StatusContext { context state } } } }
-    checkSuites(first: 8) { nodes { status conclusion createdAt app { slug } } } } } }
+    checkSuites(first: 8) { totalCount nodes { status conclusion createdAt app { slug } } } } } }
   timelineItems(last: $tl, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW, HEAD_REF_FORCE_PUSHED_EVENT,
       CONVERT_TO_DRAFT_EVENT, READY_FOR_REVIEW_EVENT, CROSS_REFERENCED_EVENT, ASSIGNED_EVENT, CLOSED_EVENT, MERGED_EVENT, REOPENED_EVENT]) {
     totalCount
@@ -1464,6 +1505,52 @@ mod tests {
         Pass::new(gh, now, 1_500, RUN_REQUESTS)
     }
 
+    #[test]
+    fn a_pass_dates_what_it_reads_by_the_time_since_it_started() {
+        let gh = GitHub::with_api("t", "http://127.0.0.1:1").unwrap();
+        let now: DateTime<Utc> = "2026-10-17T00:00:00Z".parse().unwrap();
+        let p = pass(&gh, now);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let at = p.clock();
+        assert!(
+            at >= now + chrono::Duration::milliseconds(30)
+                && at < now + chrono::Duration::seconds(30),
+            "{at}"
+        );
+    }
+
+    #[test]
+    fn the_sweep_keeps_how_many_check_suites_the_head_has() {
+        let node = json!({"id": "PR_1", "number": 1, "commits": {"nodes": [{"commit": {
+            "statusCheckRollup": {"state": "FAILURE"},
+            "checkSuites": {"totalCount": 9, "nodes": [
+                {"status": "COMPLETED", "conclusion": "FAILURE", "createdAt": "2026-10-17T11:00:00Z",
+                 "app": {"slug": "github-actions"}}]}}}]}});
+        let light = parse_light(&node).unwrap();
+        assert_eq!((light.suites.len(), light.suites_total), (1, Some(9)));
+    }
+
+    #[test]
+    fn mains_passing_checks_are_kept_only_when_one_page_holds_every_check() {
+        let target = |more: bool| {
+            json!({"oid": "m", "statusCheckRollup": {"state": "FAILURE", "contexts": {
+                "pageInfo": {"hasNextPage": more},
+                "nodes": [{"__typename": "CheckRun", "name": "test", "conclusion": "SUCCESS"},
+                          {"__typename": "CheckRun", "name": "lint", "conclusion": "FAILURE"}]}}})
+        };
+        let all = parse_main(&target(false)).unwrap();
+        assert_eq!(
+            (all.passing, all.failing),
+            (vec!["test".to_string()], vec!["lint".to_string()])
+        );
+        let part = parse_main(&target(true)).unwrap();
+        assert!(
+            part.passing.is_empty(),
+            "a failing `test` may be on the next page"
+        );
+        assert_eq!(part.failing, ["lint"]);
+    }
+
     /// The input of a call about `repos` with the app's limits.
     fn input<'a>(
         repos: &'a [String],
@@ -1520,7 +1607,8 @@ mod tests {
                         "messageHeadline": "Merge branch 'main' into fix/pen", "message": "",
                         "author": {"email": "ann@example.com", "user": {"login": "Ann-Example"}}}},
             {"commit": {"oid": "c3", "authoredDate": "2026-10-11T02:00:00Z", "additions": 20, "deletions": 0,
-                        "messageHeadline": "Review fix", "message": "Review fix",
+                        "messageHeadline": "Revert \"Pen: rough curves\"",
+                        "message": "Revert \"Pen: rough curves\"\n\nThis reverts commit 0123456789abcdef.",
                         "author": {"email": "m2@example.com", "user": {"login": "maint-two"}}}}
           ]},
           "head": {"nodes": [{"commit": {"oid": "abc",
@@ -1528,7 +1616,7 @@ mod tests {
               {"__typename": "CheckRun", "name": "build", "conclusion": "FAILURE", "status": "COMPLETED"},
               {"__typename": "CheckRun", "name": "lint", "conclusion": "SUCCESS", "status": "COMPLETED"},
               {"__typename": "StatusContext", "context": "ci/legacy", "state": "ERROR"}]}},
-            "checkSuites": {"nodes": [{"status": "COMPLETED", "conclusion": "FAILURE",
+            "checkSuites": {"totalCount": 1, "nodes": [{"status": "COMPLETED", "conclusion": "FAILURE",
                                        "createdAt": "2026-10-11T03:00:00Z", "app": {"slug": "github-actions"}}]}}}]},
           "timelineItems": {"totalCount": 4, "nodes": [
             {"__typename": "PullRequestReview", "id": "r1", "submittedAt": "2026-10-11T05:00:00Z", "state": "APPROVED",
@@ -1568,6 +1656,8 @@ mod tests {
         assert_eq!(co[0].login.as_deref(), Some("bo-sample"));
         assert_eq!(c.commits[0].author_email, "ann@example.com");
         assert!(!c.commits[0].is_merge && c.commits[1].is_merge && !c.commits[2].is_merge);
+        assert_eq!(c.commits[2].reverts, ["0123456789abcdef"]);
+        assert!(c.commits[0].reverts.is_empty());
         assert_eq!(c.merge_commit.as_ref().map(|m| m.parents), Some(2));
         assert_eq!(
             c.merge_commit.as_ref().map(|m| m.headline.as_str()),
@@ -1575,7 +1665,12 @@ mod tests {
         );
         assert_eq!(r.checks.rollup.as_deref(), Some("FAILURE"));
         assert_eq!(r.checks.failing, ["build", "ci/legacy"]);
+        assert_eq!(
+            r.checks.failing_statuses,
+            Some(vec!["ci/legacy".to_string()])
+        );
         assert_eq!(r.checks.suites[0].app.as_deref(), Some("github-actions"));
+        assert_eq!(r.checks.suites_total, Some(1));
         let kinds: Vec<&str> = r.timeline.iter().map(|i| i.kind.as_str()).collect();
         assert_eq!(
             kinds,
@@ -1807,7 +1902,10 @@ mod tests {
             &json!({"data": {
                 "repository": {
                     "defaultBranchRef": {"target": {"oid": "main1", "statusCheckRollup": {"state": "FAILURE",
-                        "contexts": {"nodes": [{"__typename": "CheckRun", "name": "test", "conclusion": "FAILURE"}]}}}},
+                        "contexts": {"nodes": [{"__typename": "CheckRun", "name": "test", "conclusion": "FAILURE"},
+                                               {"__typename": "CheckRun", "name": "lint", "conclusion": "SUCCESS"},
+                                               {"__typename": "StatusContext", "context": "ci/legacy", "state": "SUCCESS"},
+                                               {"__typename": "CheckRun", "name": "docs", "conclusion": "SKIPPED"}]}}}},
                     "pullRequests": {"totalCount": open.len(), "pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": open}
                 },
                 "rateLimit": {"cost": 1, "remaining": 3800}
@@ -1908,6 +2006,20 @@ mod tests {
         let main = cache.main_checks.clone().unwrap();
         assert_eq!(main.oid, "main1");
         assert_eq!(main.failing, ["test"]);
+        assert_eq!(
+            main.passing,
+            ["lint", "ci/legacy"],
+            "a skipped check is neither"
+        );
+        let seen = cache.main_history.last().unwrap();
+        assert_eq!(seen.oid, "main1", "the sweep keeps the head in the history");
+        // The sweep answers after the changed list's request, so the pass's
+        // clock has moved past `now` by then.
+        assert!(
+            seen.first_seen.is_some_and(|at| at > now),
+            "dated by the pass's clock: {:?}",
+            seen.first_seen
+        );
 
         // Nothing changed, the sweep is not due and the walk is done.
         let offline = GitHub::with_api("t", "http://127.0.0.1:1").unwrap();

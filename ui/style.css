@@ -235,3 +235,24 @@ td.empty { text-align: center; position: static; white-space: normal; }
 #mine-table th:nth-child(3), #mine-table th:nth-child(7) { text-align: left; }
 .mine-title { display: inline-block; max-width: 420px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
 .flag-note { margin-left: 4px; }
+
+/* ───── track record ───── */
+#track-table thead tr.cols th { cursor: default; }
+#track-table thead tr.cols th:hover { color: var(--muted); }
+.level { font-size: 10.5px; padding: 0 6px; border-radius: 8px; background: var(--surface); white-space: nowrap; cursor: help; }
+.level.untrusted { color: var(--bad); background: color-mix(in srgb, var(--bad) 13%, transparent); }
+.level.review { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.level.trusted { color: var(--good); background: color-mix(in srgb, var(--good) 14%, transparent); }
+.level.not-enough { color: var(--muted); }
+.track-tag { margin-left: 6px; font-size: 10px; padding: 0 5px; border-radius: 8px; background: var(--surface); color: var(--muted); white-space: nowrap; }
+.track-tag.recent { color: var(--bad); }
+.rate-bar { position: relative; display: inline-block; width: 80px; height: 8px; border-radius: 3px; background: var(--surface); box-shadow: inset 0 0 0 1px var(--border); vertical-align: middle; cursor: help; }
+.rate-band { position: absolute; top: 1px; bottom: 1px; min-width: 2px; border-radius: 2px; background: rgb(var(--hot-rgb) / .5); }
+.rate-base { position: absolute; top: -2px; bottom: -2px; width: 2px; margin-left: -1px; background: var(--fg); }
+#track-table tr.you-head > td { position: static; text-align: left; color: var(--muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; padding-top: 8px; }
+.track-detail { padding: 4px 0 8px 22px; }
+.track-detail p { margin: 2px 0; }
+.track-detail h4 { margin: 6px 0 3px; color: var(--muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+.track-event { margin: 2px 0; font-size: 11px; }
+.track-event .kind { font-weight: 600; }
+.track-event.fault .kind { color: var(--bad); }
