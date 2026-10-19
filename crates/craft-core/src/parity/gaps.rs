@@ -499,6 +499,9 @@ fn pair_top(top: &mut [Gap], section: &mut Vec<Gap>) {
                 t.paired_with.push(s.id.clone());
                 if !t.hours.is_ok() && s.hours.is_ok() {
                     t.hours = s.hours.clone();
+                    if t.counted_in.is_none() {
+                        t.counted_in = s.counted_in.clone();
+                    }
                 }
                 let alpha = merge_flag(&mut t.alpha, &s.alpha);
                 if merge_flag(&mut t.beta, &s.beta) || alpha {
@@ -597,6 +600,10 @@ fn unranked_headings(d: &Doc, ctx: &Ctx, gaps: &mut Vec<Gap>, ranked: &Table) {
                     },
                     blocks_src: matches!(beta, Flag::Yes).then(|| "marker".to_string()),
                     beta,
+                    counted_in: hours
+                        .as_ref()
+                        .and_then(|h| h.as_ref().ok())
+                        .and_then(|h| h.counted_in.clone()),
                     hours: match hours {
                         Some(Ok(h)) => Cell::ok(h, d.src(s.line)),
                         Some(Err(why)) => Cell::absent(why),
@@ -648,7 +655,11 @@ fn unranked_headings(d: &Doc, ctx: &Ctx, gaps: &mut Vec<Gap>, ranked: &Table) {
                     title: md::plain(head).trim_end_matches('.').to_string(),
                     blocks_src: matches!(beta, Flag::Yes).then(|| "marker".to_string()),
                     beta,
-                    alpha: Flag::No,
+                    alpha: if ALPHA.is_match(&b.text) {
+                        Flag::Yes
+                    } else {
+                        Flag::No
+                    },
                     hours: Cell::ok(hours, d.src(b.line)),
                     src: d.src(b.line),
                     issues: md::MdCell::new(&b.text).issues,
@@ -794,7 +805,12 @@ fn form_b(d: &Doc, ctx: &Ctx) -> Vec<Gap> {
                 text,
                 url,
             });
-        let hours = match estimate.map(|e| value::hours(&e, "", "")) {
+        let parsed = estimate.map(|e| value::hours(&e, "", ""));
+        let counted_in = parsed
+            .as_ref()
+            .and_then(|h| h.as_ref().ok())
+            .and_then(|h| h.counted_in.clone());
+        let hours = match parsed {
             Some(Ok(hh)) => Cell::ok(hh, d.src(h.line)),
             Some(Err(why)) => Cell::Unreadable {
                 why: "the Estimate is not a number".into(),
@@ -812,6 +828,7 @@ fn form_b(d: &Doc, ctx: &Ctx) -> Vec<Gap> {
             blocks_src: Some("heading".into()),
             priority,
             kinds,
+            counted_in,
             hours,
             doc,
             src: d.src(h.line),
@@ -1259,6 +1276,18 @@ mod tests {
     }
 
     #[test]
+    fn a_paired_section_row_lends_its_counted_in_estimate() {
+        let md = "## Top 10 across everything\n| # | Gap | Est. |\n|---|---|---|\n\
+            | 1 | **No toolkit** (#392) | |\n| 2 | **No autosave** | 10–15 |\n\n\
+            ## UI\n| # | Gap | Est. |\n|---|---|---|\n| U3 | Toolkit missing (#392) | 40–60 (in 2) |\n";
+        let p = gaps(md);
+        assert_eq!(p.gaps[0].paired_with, ["U3"]);
+        assert_eq!(p.gaps[0].hours.get().map(|h| (h.lo, h.hi)), Some((40, 60)));
+        assert_eq!(p.gaps[0].counted_in.as_deref(), Some("2"));
+        assert_eq!(p.gaps[1].counted_in, None);
+    }
+
+    #[test]
     fn form_b_headings_with_a_wrapped_estimate() {
         let md = "Kind: **F** feature · **L** localization ·\n**P** performance.\n\n## Blocking (beta can't be declared)\n\n\
             ### 1. Basic editing fails (F, P)\n- **Missing:** paste\n- It is slow. **Estimate:**\n  30–50 h (reproduce).\n\n\
@@ -1294,6 +1323,19 @@ mod tests {
         assert_eq!(doc, Some("docs/platform-parity.md"), "a Doc item first");
         assert_eq!(g[2].kinds, ["platforms"]);
         assert!(matches!(g[2].hours, Cell::Unreadable { .. }));
+    }
+
+    #[test]
+    fn form_b_estimates_counted_in_another_gap() {
+        let md = "## Blocking\n\n### 1. Toolkit missing\n- **Estimate:** 40–60 h\n\n\
+            ### 2. Toolkit menus\n- **Estimate:** 10–20 h (in 1)\n";
+        let p = gaps(md);
+        assert_eq!(p.gaps[0].counted_in, None);
+        assert_eq!(p.gaps[1].counted_in.as_deref(), Some("1"));
+        assert_eq!(
+            p.gap_totals.beta.map(|b| (b.count, b.lo, b.hi)),
+            Some((1, 40, 60))
+        );
     }
 
     #[test]
@@ -1341,6 +1383,29 @@ mod tests {
         assert_eq!(p.gaps[2].hours.get().map(|h| (h.lo, h.hi)), Some((4, 8)));
         assert_eq!(p.gaps[2].beta, Flag::No);
         assert_eq!(p.gaps[4].hours.get().map(|h| (h.lo, h.hi)), Some((6, 10)));
+    }
+
+    #[test]
+    fn unranked_bullets_and_headings_keep_alpha_markers_and_counted_in() {
+        let md = "| # | Gap | Hours |\n|---|---|---|\n| 1 | No toolkit | 40–60 |\n| 2 | Window chrome | 2–4 |\n\n\
+            ## UI/UX\n\n- **Autosave missing** 3–5 h. **Alpha blocker.**\n- **Window chrome** (#71). 2–4 h. **Alpha blocker.**\n\n\
+            ## Features\n\n### Context menus incomplete\n- **Estimate:** 10–20 h (in 1).\n";
+        let p = gaps(md);
+        let rows: Vec<(&str, Flag, Option<&str>)> = p
+            .gaps
+            .iter()
+            .map(|g| (g.title.as_str(), g.alpha.clone(), g.counted_in.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("No toolkit", Flag::No, None),
+                ("Window chrome", Flag::Yes, None),
+                ("Autosave missing", Flag::Yes, None),
+                ("Context menus incomplete", Flag::No, Some("1")),
+            ]
+        );
+        assert_eq!(p.gap_totals.alpha, 2);
     }
 
     #[test]

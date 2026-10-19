@@ -829,7 +829,7 @@ export function reviewAgeDays(p: Parity | null | undefined, now: number = Date.n
 /** When any parity document last changed: the newest last commit to one; null when unknown. */
 export function changedAt(p: Parity | null | undefined): string | null {
   const times = (p?.files ?? []).map((f) => f.commit_date).filter((s): s is string => !!s);
-  return times.length ? times.reduce((a, b) => (Date.parse(a) > Date.parse(b) ? a : b)) : null;
+  return times.reduce<string | null>((a, b) => (a !== null && Date.parse(a) > Date.parse(b) ? a : b), null);
 }
 
 const STAGES = ['pre-alpha', 'early alpha', 'alpha', 'beta', 'stable'];

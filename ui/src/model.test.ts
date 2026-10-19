@@ -447,6 +447,9 @@ test('review age, last change, dimension means and source links', () => {
   const files = [doc('ROADMAP.md', { commit_date: '2026-10-17T09:00:00Z' }), doc('docs/gaps.md', { commit_date: '2026-10-18T08:00:00Z' }), doc('docs/ui-parity.md')];
   assert.equal(changedAt(parity({ files })), '2026-10-18T08:00:00Z');
   assert.equal(changedAt(parity({ files: [doc('ROADMAP.md')] })), null, 'last commits not read');
+  assert.equal(changedAt(parity({ files: [] })), null, 'no parity documents');
+  assert.equal(changedAt(null), null, 'no parity');
+  assert.equal(changedAt(parity({ files: [doc('ROADMAP.md', { commit_date: '2026-10-18T08:00:00Z' }), doc('docs/gaps.md', { commit_date: '2026-10-18T08:00:00Z' })] })), '2026-10-18T08:00:00Z', 'equal times');
   const heat = (column: Heat['column'], value: number | null): Heat => ({ column, value, text: value === null ? 'ahead' : `${value}%`, rows: [], src: null });
   const means = heatMeans([
     app('a', { heat: [heat('features', 80), heat('ai', null)] }),
