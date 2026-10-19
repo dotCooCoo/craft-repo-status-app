@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/craft-core", "crates/craft-github", "crates/craft-status-app"]
+members = ["crates/craft-core", "crates/craft-github", "crates/craft-mcp", "crates/craft-status-app"]
 
 [workspace.package]
 version = "0.1.0"

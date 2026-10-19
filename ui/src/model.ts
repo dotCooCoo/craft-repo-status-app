@@ -626,7 +626,7 @@ export const ALL_REPOS = '*';
 /** The state of a pull request whose timeline has not been read yet: `NOT_READ_YET` in states.rs. */
 export const NOT_READ_YET = 'not_read_yet';
 
-/** The states in rule order, with their labels. */
+/** The states in rule order, with their labels: `STATE_LABELS` in rows.rs. */
 export const STATE_LABELS: Readonly<Record<string, string>> = {
   author_stepped_back: 'Author stepped back',
   held_for_owner: 'Held for owner',
@@ -788,7 +788,7 @@ function byRepo<T>(rec: Record<string, T> | undefined, repo: string): T | null {
   return key === undefined ? null : rec[key]!;
 }
 
-/** `p`'s figures in `window` for `repo` ('' for every repo). */
+/** `p`'s figures in `window` for `repo` ('' for every repo): `person_figures` in rows.rs. */
 export function personFigures(view: PeopleView, p: PersonRow, window: string, repo: string): PersonFigures {
   const items = repoItems(view, repo);
   const own = items.filter((i) => i.author === p.key);
@@ -1211,6 +1211,8 @@ export function repoFigures(view: PeopleView, repo: string, window: string, now:
 // ───────────────────────────── my prs ─────────────────────────────
 // The My PRs tab lists the People view's open items whose author is one
 // login, in the configured repos, with a blocker from each item's work state.
+// crates/craft-core/src/people/rows.rs works out the same rows, and the
+// People tab's Work rows, for craft-mcp: change both together.
 
 /** The login My PRs lists: `people.my_login` from the config, otherwise the token's user; null before either is known. */
 export function myLogin(view: Pick<PeopleView, 'my_login' | 'viewer'> | null | undefined): string | null {

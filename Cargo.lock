@@ -455,6 +455,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-mcp"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "craft-core",
+ "serde_json",
+]
+
+[[package]]
 name = "craft-status-app"
 version = "0.1.0"
 dependencies = [

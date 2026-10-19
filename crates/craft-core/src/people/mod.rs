@@ -11,8 +11,10 @@ pub mod ledger;
 pub mod rank;
 pub mod record;
 pub mod roster;
+pub mod rows;
 pub mod states;
 pub mod view;
+pub mod viewer;
 
 use std::collections::{BTreeMap, BTreeSet};
 

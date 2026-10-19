@@ -13,6 +13,8 @@ cache, and tells you what to fix first. Everything runs locally: no server.
     and it is unit-tested.
   - `craft-github`: the GitHub GraphQL/REST fetcher, plus a `craft-fetch` CLI
     that prints a table, for debugging.
+  - `craft-mcp`: a read-only MCP server over the app's cache (see
+    [MCP server](#mcp-server)).
   - `craft-status-app`: the Tauri 2 shell (poll thread, tray, global
     shortcut, window).
 - **TypeScript, HTML and CSS** in `ui/`, with no framework or bundler. `tsc`
@@ -293,6 +295,8 @@ need your reply. The tab's badge counts those pull requests.
   - `prs/<owner>@<repo>.json`: each repo's pull request records for the
     People tab, saved after each stage of an update; `roster.json` keeps a
     downloaded roster for an hour. People data stays out of `snapshot.json`.
+  - `viewer.json`: the login of the user the GitHub token belongs to, as
+    the app last read it, for `craft-mcp`.
 - The GitHub token comes from the first of `$CRAFT_STATUS_GITHUB_TOKEN`,
   `$GITHUB_TOKEN` and `$GH_TOKEN` that is set, then from `github_token` in the
   config, then from `gh auth token`. The app is started by launchd, not a
@@ -340,6 +344,47 @@ The `[people]` table sets up the People tab:
   landed counts are marked unverified.
 - `my_login` (default empty): the GitHub login whose open pull requests the
   My PRs tab lists. Leave it empty for the user the GitHub token belongs to.
+
+## MCP server
+
+`craft-mcp` is a read-only [MCP](https://modelcontextprotocol.io) server
+that gives an agent what the window shows. It speaks JSON-RPC over stdin and
+stdout. Each call reads the config file and `snapshot.json` in
+`~/Library/Caches/craft-status/`. The tools about pull requests also read the
+`prs/` records, the kept roster and `viewer.json`. It does not send requests
+to GitHub, write files or show the token. Its tools are:
+
+- `repos`: each repo's row in the Repos table, with the age of its data.
+- `repo`: one repo's stats, urgent issues, open pull requests by work state,
+  checks on `main` and pull request flow.
+- `my_prs`: the My PRs rows, with each pull request's failing checks and
+  mergeable state. It lists the pull requests of `people.my_login`, or of the
+  token's user as the app last read it.
+- `people`: the People tab's Work rows for a window, in every repo or one.
+- `pull_request`: one pull request's record and work state, with the rule
+  that set it.
+
+Names appear only when the config sets a roster, as in the People tab. The
+answers are as old as the app's last fetch, and each one gives the times.
+
+Build it, then add the binary to your MCP client's servers:
+
+```sh
+cargo build --release -p craft-mcp    # target/release/craft-mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "craft-status": {
+      "command": "/path/to/craft-repo-status-app/target/release/craft-mcp"
+    }
+  }
+}
+```
+
+`--cache-dir DIR` and `--config FILE` read another cache directory or config
+file.
 
 ## Build, install, test
 

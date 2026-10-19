@@ -28,7 +28,7 @@ use craft_core::people::rank::{direct, Direct, PersonDetail, Rankings, RepoPeopl
 use craft_core::people::record::PrCache;
 use craft_core::people::roster::{self, RosterRow};
 use craft_core::people::view::{assemble, PeopleView};
-use craft_core::people::Directory;
+use craft_core::people::{viewer, Directory};
 use craft_core::{Cache, Config, Schedule, Snapshot, TokenStatus, WindowState};
 use craft_github::gate::PollSession;
 use craft_github::prs::{download_roster, PrEvent, PrInput, Seen, RUN_REQUESTS};
@@ -799,8 +799,19 @@ fn run_people(app: &AppHandle, job: &PeopleJob, runs: &mut PeopleRuns) {
                 interval,
                 &mut runs.viewer.login,
             );
+            keep_viewer(cache.dir(), runs.viewer.login.as_deref(), now);
         }
         Err(e) => eprintln!("people: {e}"),
+    }
+}
+
+/// Keeps the token user's `login`, read at `now`, in `dir`'s `viewer.json`
+/// for `craft-mcp` ([`viewer::keep`]), and logs a failure.
+fn keep_viewer(dir: &Path, login: Option<&str>, now: DateTime<Utc>) {
+    if let Some(login) = login {
+        if let Err(e) = viewer::keep(dir, login, now) {
+            eprintln!("people: keeping the token's login: {e}");
+        }
     }
 }
 
@@ -1356,6 +1367,28 @@ mod tests {
             e.fetched_at = Some(now - CDuration::minutes(*m));
         }
         s
+    }
+
+    #[test]
+    fn the_token_users_login_is_kept_for_craft_mcp() {
+        let dir = std::env::temp_dir().join(format!("craft-status-viewer-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let at = |h: u32| {
+            format!("2026-10-18T{h:02}:00:00Z")
+                .parse::<DateTime<Utc>>()
+                .unwrap()
+        };
+        keep_viewer(&dir, None, at(1));
+        assert_eq!(viewer::load(&dir), None, "no login, no file");
+        keep_viewer(&dir, Some("Ann-Example"), at(2));
+        keep_viewer(&dir, Some("ann-example"), at(3));
+        let kept = viewer::load(&dir).unwrap();
+        assert_eq!(
+            (kept.login.as_str(), kept.read_at),
+            ("Ann-Example", Some(at(2))),
+            "kept once, not rewritten for another letter case"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
