@@ -477,6 +477,26 @@ test('invalid values disable Save and say why', async () => {
   assert.equal((h.calls.find((c) => c.cmd === 'save_settings')?.args?.config as Config).poll_minutes, 90);
 });
 
+test('each field names its message for screen readers', async () => {
+  const h = await setup({ host: fileHost({ settings: settingsOf(config({ repos: ['o/a', 'O/A'] }), true) }) });
+  await openSettings(h);
+  const errorOf = (key: string) => h.doc.querySelector(`.field-error[data-for="${key}"]`);
+  const describes = (input: Element, expected: (Element | null)[], what: string) => {
+    const linked = (input.getAttribute('aria-describedby') ?? '').split(' ').map((id) => h.doc.getElementById(id));
+    assert.ok(linked.length === expected.length && linked.every((n, i) => n !== null && n === expected[i]), what);
+  };
+  for (const key of ['poll_minutes', 'window.opacity', 'tray.close_to_tray', 'shortcuts.toggle_window']) {
+    describes(field(h, key), [errorOf(key)], key);
+  }
+  describes(field(h, 'github_token'), [h.doc.getElementById('settings-token-source'), errorOf('github_token')], 'github_token');
+  const repoInput = h.doc.getElementById('settings-repo-input')!;
+  describes(repoInput, [h.doc.getElementById('settings-repo-error'), errorOf('repos')], 'repos');
+  assert.match(fieldError(h, 'repos'), /listed twice/);
+  assert.equal(repoInput.getAttribute('aria-invalid'), 'true', 'a repos problem marks the repo input');
+  (h.doc.querySelector('#settings-repos button[aria-label="Remove O/A"]') as HTMLButtonElement).click();
+  assert.equal(repoInput.getAttribute('aria-invalid'), 'false');
+});
+
 test('the repo list adds, checks, reorders and removes repos', async () => {
   const h = await setup({ host: fileHost({ settings: settingsOf() }) });
   await openSettings(h);

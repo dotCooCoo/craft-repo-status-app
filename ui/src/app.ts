@@ -474,16 +474,16 @@ export function start(api: Api): () => void {
     checkSettings();
   }
 
-  /** Shows each field's problem and enables Save when there are none. The
-   * fields are disabled while a save runs, since the reload after it
-   * replaces them. */
+  /** Shows each field's problem and enables Save when there are none. A
+   * problem marks the input its message describes as invalid. The fields are
+   * disabled while a save runs, since the reload after it replaces them. */
   function checkSettings(): void {
     const problems = settings ? settingsProblems(settings.draft) : {};
     document.querySelectorAll<HTMLFieldSetElement>('#settings-form fieldset').forEach((f) => { f.disabled = saving; });
     document.querySelectorAll<HTMLElement>('#settings-form .field-error[data-for]').forEach((n) => {
       const key = n.dataset.for ?? '';
       n.textContent = problems[key] ?? '';
-      document.getElementById(settingId(key))?.setAttribute('aria-invalid', String(key in problems));
+      document.querySelector(`#settings-form [aria-describedby~="${n.id}"]`)?.setAttribute('aria-invalid', String(key in problems));
     });
     $<HTMLButtonElement>('settings-save').disabled = !settings || saving || Object.keys(problems).length > 0;
   }
@@ -542,17 +542,20 @@ export function start(api: Api): () => void {
       });
       input.value = typeof v === 'number' || typeof v === 'string' ? String(v) : '';
     }
+    const errorId = `${id}-error`;
+    input.setAttribute('aria-describedby', f.kind === 'secret' ? `settings-token-source ${errorId}` : errorId);
     return el('div', { class: 'setting' },
       el('label', { for: id }, f.label,
         f.relaunch && el('span', { class: 'relaunch', title: 'Applies when Craft Status is next launched' }, 'relaunch')),
       el('div', { class: 'setting-input' }, input, ...extra,
         f.help && el('span', { class: 'help' }, f.help),
-        el('span', { class: 'field-error', dataset: { for: f.key } })));
+        el('span', { class: 'field-error', id: errorId, dataset: { for: f.key } })));
   }
 
   function repoEditor(): HTMLElement {
     const input = el('input', {
       type: 'text', id: 'settings-repo-input', placeholder: 'owner/name or a GitHub URL', spellcheck: 'false', autocomplete: 'off',
+      'aria-describedby': `settings-repo-error ${settingId('repos')}-error`,
       oninput: () => { error.textContent = ''; },
       onkeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') { e.preventDefault(); add(); } },
     });
@@ -569,7 +572,7 @@ export function start(api: Api): () => void {
       el('ol', { class: 'repo-list', id: 'settings-repos' }),
       el('div', { class: 'repo-add' }, input, el('button', { class: 'button', id: 'settings-repo-add', onclick: add }, 'Add')),
       error,
-      el('span', { class: 'field-error', dataset: { for: 'repos' } }));
+      el('span', { class: 'field-error', id: `${settingId('repos')}-error`, dataset: { for: 'repos' } }));
   }
 
   /** Draws the repo list. Drawing it replaces every button, the focused one

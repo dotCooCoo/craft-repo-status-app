@@ -42,8 +42,9 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Write via a temp file + rename so readers never see a half-written file.
-/// A symlink is followed, so the file it points at is replaced, and the new
-/// file gets the permissions of the one it replaces.
+/// A symlink is followed, so the file it points at is replaced (or created,
+/// when it does not exist yet), and the new file gets the permissions of the
+/// one it replaces.
 pub fn atomic_write(path: &std::path::Path, text: &str) -> Result<()> {
     write_replacing(path, text, false)
 }
@@ -54,8 +55,35 @@ pub fn atomic_write_private(path: &std::path::Path, text: &str) -> Result<()> {
     write_replacing(path, text, true)
 }
 
+/// Symlinks one write can follow before it gives up, as Linux's `ELOOP` limit.
+const MAX_LINKS: usize = 40;
+
+/// The file a write to `path` replaces: `path`, or the file its symlinks lead
+/// to, even when that file does not exist yet.
+fn write_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+        if !is_link {
+            return Ok(path);
+        }
+        let target = std::fs::read_link(&path).map_err(|source| Error::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        path = match path.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
+    }
+    Err(Error::Io {
+        path: path.display().to_string(),
+        source: std::io::Error::other("too many levels of symbolic links"),
+    })
+}
+
 fn write_replacing(path: &std::path::Path, text: &str, private: bool) -> Result<()> {
-    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = &write_path(path)?;
     let io = |source| Error::Io {
         path: path.display().to_string(),
         source,
@@ -98,4 +126,51 @@ fn write_replacing(path: &std::path::Path, text: &str, private: bool) -> Result<
     std::io::Write::write_all(&mut file, text.as_bytes()).map_err(io)?;
     drop(file);
     std::fs::rename(&tmp, path).map_err(io)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_keeps_a_dangling_symlink() {
+        let dir = std::env::temp_dir().join(format!("craft-dangling-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The link names a file, in a folder, that neither exists yet.
+        let target = dir.join("dotfiles").join("config.toml");
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        atomic_write(&link, "poll_minutes = 20\n").unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "poll_minutes = 20\n"
+        );
+        // A relative link that leads through a second one.
+        let hop = dir.join("hop.toml");
+        std::os::unix::fs::symlink("config.toml", &hop).unwrap();
+        atomic_write_private(&hop, "poll_minutes = 25\n").unwrap();
+        assert!(std::fs::symlink_metadata(&hop)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "poll_minutes = 25\n"
+        );
+        // Links that lead back to themselves are refused and left in place.
+        let a = dir.join("a.toml");
+        let b = dir.join("b.toml");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(atomic_write(&a, "x").is_err());
+        assert!(std::fs::symlink_metadata(&a)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

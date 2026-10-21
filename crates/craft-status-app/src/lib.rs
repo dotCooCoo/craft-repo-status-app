@@ -190,7 +190,7 @@ fn save_and_apply(
     let pinned = pinned_after_save(&config, base, live);
     let config = prepare_save(config, base, keep_token, &path)?;
     config.save_to(&path).map_err(|e| e.to_string())?;
-    reload_config_if_changed(app);
+    reload_config_if_changed(app, true);
     let reloaded = state.config.lock().unwrap().window.always_on_top;
     if reloaded != pinned {
         set_pinned(app, pinned);
@@ -309,15 +309,23 @@ fn config_mtime() -> Option<SystemTime> {
         .and_then(|m| m.modified().ok())
 }
 
-/// Re-read the config if it changed on disk. A broken file keeps the old
-/// config and surfaces the parse error in the window. The poll thread and a
-/// Settings save both call it; holding `config_mtime` throughout makes one
-/// wait for the other, so an older read never replaces a newer one.
-fn reload_config_if_changed(app: &AppHandle) {
+/// Whether the config is read again: always when `force`, else when its
+/// modification time differs from the one last read.
+fn needs_reload(seen: Option<SystemTime>, now: Option<SystemTime>, force: bool) -> bool {
+    force || seen != now
+}
+
+/// Re-read the config if it changed on disk, or with `force` in any case: a
+/// Settings save can leave the file with the modification time it had, on a
+/// file system that stores coarse times. A broken file keeps the old config
+/// and surfaces the parse error in the window. The poll thread and a Settings
+/// save both call it; holding `config_mtime` throughout makes one wait for
+/// the other, so an older read never replaces a newer one.
+fn reload_config_if_changed(app: &AppHandle, force: bool) {
     let state = app.state::<AppState>();
     let mut seen = state.config_mtime.lock().unwrap();
     let mtime = config_mtime();
-    if *seen == mtime {
+    if !needs_reload(*seen, mtime, force) {
         return;
     }
     *seen = mtime;
@@ -614,7 +622,7 @@ fn spawn_poller(app: AppHandle, rx: mpsc::Receiver<Wake>) {
             let mut pacing = Pacing::default();
             let mut last_manual: Option<DateTime<Utc>> = None;
             loop {
-                reload_config_if_changed(&app);
+                reload_config_if_changed(&app, false);
                 step(&app, &mut pacing);
                 // Staleness changes with the clock alone.
                 update_tray(&app);
@@ -1044,6 +1052,16 @@ mod tests {
             (None, Some(now), Some(now)),
             "a refresh still refreshes everything"
         );
+    }
+
+    #[test]
+    fn a_save_reloads_the_config_when_its_time_did_not_change() {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+        let later = t + std::time::Duration::from_secs(1);
+        assert!(!needs_reload(Some(t), Some(t), false), "the poll skips it");
+        assert!(needs_reload(Some(t), Some(t), true), "a save reads it");
+        assert!(needs_reload(Some(t), Some(later), false));
+        assert!(needs_reload(Some(t), None, false), "the file went away");
     }
 
     #[test]
