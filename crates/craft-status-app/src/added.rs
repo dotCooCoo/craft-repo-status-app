@@ -124,15 +124,16 @@ fn record(
     // The config as Keep or Hide left it, if either wrote it during the
     // search. They reload it before they take this lock to prune.
     let cfg = state.config.lock().unwrap().clone();
-    match result {
+    let done = match result {
         Ok(one) => {
             if one.graphql_remaining.is_some() {
                 snap.rate_limit_remaining = one.graphql_remaining;
             }
-            if let Some(all) = searched(found, one) {
-                apply_search(found, &cfg, &mut snap, &all);
-                found.next_at = Some(now + chrono::Duration::seconds(cfg.poll_secs()));
-            }
+            searched(found, one)
+        }
+        Err(e @ (GhError::GraphQl(_) | GhError::NotFound)) => {
+            eprintln!("open pull request search for {owner}: {e}");
+            failed(found)
         }
         Err(e) => {
             eprintln!("open pull request search for {owner}: {e}");
@@ -144,7 +145,12 @@ fn record(
                 _ => REPO_RETRY,
             };
             found.next_at = Some(now + chrono::Duration::seconds(wait));
+            None
         }
+    };
+    if let Some(all) = done {
+        apply_search(found, &cfg, &mut snap, &all);
+        found.next_at = Some(now + chrono::Duration::seconds(cfg.poll_secs()));
     }
     // Keep a config error up until the file is fixed.
     let config_error = snap
@@ -206,6 +212,13 @@ fn searched(found: &mut Found, one: OpenPrs) -> Option<OpenPrs> {
     } else {
         None
     }
+}
+
+/// Ends the search for the round's next owner as incomplete, after an error
+/// GitHub gives again on every try for that owner, so the round goes on to
+/// the next owner and counts no misses. Returns what [`searched`] returns.
+fn failed(found: &mut Found) -> Option<OpenPrs> {
+    searched(found, OpenPrs::default())
 }
 
 /// The login of the user `token` belongs to: the one held for that token, or
@@ -482,6 +495,52 @@ mod tests {
         assert_eq!(rows(&s), ["acme/one", "acme/two", "acme/new (added)"]);
         assert_eq!(s.rate_limit_remaining, Some(4000));
         assert!(found.round.is_none() && found.next_at.is_some());
+    }
+
+    #[test]
+    fn an_owner_whose_search_fails_does_not_stop_the_round() {
+        let cfg = Config::parse(r#"repos = ["acme/one", "other-org/lib"]"#).unwrap();
+        let mut s = snapshot(&cfg);
+        let mut found = Found::default();
+        apply_search(&mut found, &cfg, &mut s, &open(&["acme/old"]));
+        let state = AppState {
+            config: Mutex::new(cfg.clone()),
+            config_mtime: Mutex::new(None),
+            snapshot: Mutex::new(s),
+            cache: None,
+            refresh_tx: Mutex::new(None),
+            window_state: Mutex::new(None),
+            window_dirty: AtomicBool::new(false),
+        };
+        let now = Utc::now();
+        let refused = GhError::GraphQl("the listed users cannot be searched".into());
+        for error in [refused, GhError::NotFound] {
+            let acme = next_owner(&mut found, &cfg, now).unwrap();
+            record(&state, &mut found, &acme, Err(error), None, now);
+            assert!(found.round.is_some(), "the round goes on");
+            let other = next_owner(&mut found, &cfg, now).unwrap();
+            assert_eq!(other, "other-org");
+            let result = Ok(open(&["other-org/new"]));
+            record(&state, &mut found, &other, result, None, now);
+            assert!(found.round.is_none(), "the round ends");
+            let poll = Some(now + CDuration::seconds(cfg.poll_secs()));
+            assert_eq!(found.next_at, poll);
+        }
+        let all = [
+            "acme/one",
+            "other-org/lib",
+            "acme/old (added)",
+            "other-org/new (added)",
+        ];
+        let s = rows(&state.snapshot.lock().unwrap());
+        assert_eq!(s, all, "a round with a failed search is no miss");
+
+        let acme = next_owner(&mut found, &cfg, now).unwrap();
+        let down = GhError::Http(502, "bad gateway".into());
+        record(&state, &mut found, &acme, Err(down), None, now);
+        assert!(found.round.is_none(), "any other error starts over");
+        let retry = Some(now + CDuration::seconds(REPO_RETRY));
+        assert_eq!(found.next_at, retry);
     }
 
     #[test]
