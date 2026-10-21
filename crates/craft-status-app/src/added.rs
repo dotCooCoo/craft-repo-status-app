@@ -44,11 +44,14 @@ pub struct Found {
 }
 
 /// A round of searches, one per configured owner.
+#[derive(Debug, PartialEq)]
 struct Round {
     /// The owners still to search, in config order.
     owners: Vec<String>,
     /// What the searches so far found.
     open: OpenPrs,
+    /// The owners whose search failed or was not read to its end.
+    incomplete: Vec<String>,
 }
 
 /// Keep: writes an added row's repo into the config's `repos`.
@@ -148,8 +151,8 @@ fn record(
             None
         }
     };
-    if let Some(all) = done {
-        apply_search(found, &cfg, &mut snap, &all);
+    if let Some(round) = done {
+        apply_search(found, &cfg, &mut snap, &round.open, &round.incomplete);
         found.next_at = Some(now + chrono::Duration::seconds(cfg.poll_secs()));
     }
     // Keep a config error up until the file is fixed.
@@ -187,6 +190,7 @@ fn next_owner(found: &mut Found, cfg: &Config, now: DateTime<Utc>) -> Option<Str
                 complete: true,
                 ..Default::default()
             },
+            incomplete: Vec::new(),
         });
     }
     let owner = found.round.as_ref()?.owners.first().cloned();
@@ -197,18 +201,22 @@ fn next_owner(found: &mut Found, cfg: &Config, now: DateTime<Utc>) -> Option<Str
     owner
 }
 
-/// Adds the next owner's search to the round. Returns what the round found
-/// once it has searched every owner.
-fn searched(found: &mut Found, one: OpenPrs) -> Option<OpenPrs> {
+/// Adds the next owner's search to the round, and the owner to the round's
+/// incomplete owners when the search was not read to its end. Returns the
+/// round once it has searched every owner.
+fn searched(found: &mut Found, one: OpenPrs) -> Option<Round> {
     let round = found.round.as_mut()?;
     if !round.owners.is_empty() {
-        round.owners.remove(0);
+        let owner = round.owners.remove(0);
+        if !one.complete {
+            round.incomplete.push(owner);
+        }
     }
     round.open.repos.extend(one.repos);
     round.open.graphql_remaining = one.graphql_remaining.or(round.open.graphql_remaining);
     round.open.complete &= one.complete;
     if round.owners.is_empty() {
-        found.round.take().map(|r| r.open)
+        found.round.take()
     } else {
         None
     }
@@ -216,8 +224,9 @@ fn searched(found: &mut Found, one: OpenPrs) -> Option<OpenPrs> {
 
 /// Ends the search for the round's next owner as incomplete, after an error
 /// GitHub gives again on every try for that owner, so the round goes on to
-/// the next owner and counts no misses. Returns what [`searched`] returns.
-fn failed(found: &mut Found) -> Option<OpenPrs> {
+/// the next owner and counts no misses for that owner's repos. Returns what
+/// [`searched`] returns.
+fn failed(found: &mut Found) -> Option<Round> {
     searched(found, OpenPrs::default())
 }
 
@@ -292,9 +301,15 @@ fn pace(pacing: &mut Pacing, error: Option<&GhError>, now: DateTime<Utc>) -> Opt
 
 /// Updates the added rows from a round that found `open`: a repo `cfg`
 /// allows gets a row, and an added row is removed on its [`MISSES`]th round
-/// in a row without an open pull request. A round with a search that was not read
-/// to its end counts no misses.
-fn apply_search(found: &mut Found, cfg: &Config, snap: &mut Snapshot, open: &OpenPrs) {
+/// in a row without an open pull request. A row under one of the `incomplete`
+/// owners, whose search failed or was not read to its end, counts no miss.
+fn apply_search(
+    found: &mut Found,
+    cfg: &Config,
+    snap: &mut Snapshot,
+    open: &OpenPrs,
+    incomplete: &[String],
+) {
     let allowed: BTreeSet<&String> = open.repos.iter().filter(|r| cfg.may_add(r)).collect();
     let mut keep = Vec::new();
     let mut misses = BTreeMap::new();
@@ -303,8 +318,10 @@ fn apply_search(found: &mut Found, cfg: &Config, snap: &mut Snapshot, open: &Ope
             keep.push(repo);
             continue;
         }
+        let owner = repo.split('/').next().unwrap_or_default();
+        let searched = !incomplete.iter().any(|o| o.eq_ignore_ascii_case(owner));
         let held = found.misses.get(&repo).copied().unwrap_or(0);
-        let n = if open.complete { held + 1 } else { held };
+        let n = if searched { held + 1 } else { held };
         if n < MISSES {
             misses.insert(repo.clone(), n);
             keep.push(repo);
@@ -356,7 +373,7 @@ mod tests {
         let mut s = snapshot(&cfg);
         let mut found = Found::default();
         let search = open(&["acme/new", "stranger/fork", "ACME/one", "acme/hidden"]);
-        apply_search(&mut found, &cfg, &mut s, &search);
+        apply_search(&mut found, &cfg, &mut s, &search, &[]);
         assert_eq!(rows(&s), ["acme/one", "acme/two", "acme/new (added)"]);
     }
 
@@ -386,9 +403,10 @@ mod tests {
             ..open(&["other-org/tool"])
         };
         let all = searched(&mut found, cut_short).unwrap();
-        let repos: Vec<&str> = all.repos.iter().map(String::as_str).collect();
+        let repos: Vec<&str> = all.open.repos.iter().map(String::as_str).collect();
         assert_eq!(repos, ["acme/new", "other-org/tool"]);
-        assert!(!all.complete, "one search was cut short");
+        assert!(!all.open.complete, "one search was cut short");
+        assert_eq!(all.incomplete, ["other-org"]);
         assert!(found.round.is_none());
     }
 
@@ -399,9 +417,9 @@ mod tests {
         let mut found = Found::default();
         let both = open(&["acme/new", "acme/other"]);
         let other = open(&["acme/other"]);
-        apply_search(&mut found, &cfg, &mut s, &both);
+        apply_search(&mut found, &cfg, &mut s, &both, &[]);
         s.repos[2].fetched_at = Some(Utc::now());
-        apply_search(&mut found, &cfg, &mut s, &other);
+        apply_search(&mut found, &cfg, &mut s, &other, &[]);
         let all = [
             "acme/one",
             "acme/two",
@@ -410,20 +428,21 @@ mod tests {
         ];
         assert_eq!(rows(&s), all, "one miss keeps the row");
         assert!(s.repos[2].fetched_at.is_some(), "and its data");
-        apply_search(&mut found, &cfg, &mut s, &both);
-        apply_search(&mut found, &cfg, &mut s, &other);
+        apply_search(&mut found, &cfg, &mut s, &both, &[]);
+        apply_search(&mut found, &cfg, &mut s, &other, &[]);
         assert_eq!(rows(&s), all, "a found pull request starts the count again");
         let cut_short = OpenPrs {
             complete: false,
             ..open(&["acme/other"])
         };
-        apply_search(&mut found, &cfg, &mut s, &cut_short);
+        let acme = ["acme".to_string()];
+        apply_search(&mut found, &cfg, &mut s, &cut_short, &acme);
         assert_eq!(rows(&s), all, "a round cut short is no miss");
-        apply_search(&mut found, &cfg, &mut s, &other);
+        apply_search(&mut found, &cfg, &mut s, &other, &[]);
         let left = ["acme/one", "acme/two", "acme/other (added)"];
         assert_eq!(rows(&s), left, "two misses in a row");
-        apply_search(&mut found, &cfg, &mut s, &open(&[]));
-        apply_search(&mut found, &cfg, &mut s, &open(&[]));
+        apply_search(&mut found, &cfg, &mut s, &open(&[]), &[]);
+        apply_search(&mut found, &cfg, &mut s, &open(&[]), &[]);
         assert_eq!(rows(&s), ["acme/one", "acme/two"]);
     }
 
@@ -432,12 +451,12 @@ mod tests {
         let on = config("");
         let mut s = snapshot(&on);
         let mut found = Found::default();
-        apply_search(&mut found, &on, &mut s, &open(&["acme/new"]));
+        apply_search(&mut found, &on, &mut s, &open(&["acme/new"]), &[]);
         let off = config("auto_repos = false");
         s.sync_repos(&off.repos);
         assert!(prune(&off, &mut s), "the switch drops the rows it added");
         assert_eq!(rows(&s), ["acme/one", "acme/two"]);
-        apply_search(&mut found, &off, &mut s, &open(&["acme/new"]));
+        apply_search(&mut found, &off, &mut s, &open(&["acme/new"]), &[]);
         assert_eq!(rows(&s), ["acme/one", "acme/two"]);
         assert!(!due(&found, &Pacing::default(), &off, &s, Utc::now()));
     }
@@ -448,7 +467,7 @@ mod tests {
         let mut s = snapshot(&cfg);
         let mut found = Found::default();
         let search = open(&["acme/kept", "acme/hidden"]);
-        apply_search(&mut found, &cfg, &mut s, &search);
+        apply_search(&mut found, &cfg, &mut s, &search, &[]);
         let added = [
             "acme/one",
             "acme/two",
@@ -468,7 +487,7 @@ mod tests {
         assert!(prune(&written, &mut s));
         assert_eq!(rows(&s), ["acme/one", "acme/two", "acme/kept"]);
         assert!(s.repos[2].fetched_at.is_some(), "Keep keeps the data");
-        apply_search(&mut found, &written, &mut s, &search);
+        apply_search(&mut found, &written, &mut s, &search, &[]);
         let kept = ["acme/one", "acme/two", "acme/kept"];
         assert_eq!(rows(&s), kept, "the hidden repo stays out");
     }
@@ -502,7 +521,7 @@ mod tests {
         let cfg = Config::parse(r#"repos = ["acme/one", "other-org/lib"]"#).unwrap();
         let mut s = snapshot(&cfg);
         let mut found = Found::default();
-        apply_search(&mut found, &cfg, &mut s, &open(&["acme/old"]));
+        apply_search(&mut found, &cfg, &mut s, &open(&["acme/old"]), &[]);
         let state = AppState {
             config: Mutex::new(cfg.clone()),
             config_mtime: Mutex::new(None),
@@ -541,6 +560,45 @@ mod tests {
         assert!(found.round.is_none(), "any other error starts over");
         let retry = Some(now + CDuration::seconds(REPO_RETRY));
         assert_eq!(found.next_at, retry);
+    }
+
+    #[test]
+    fn a_miss_counts_only_where_the_owners_search_was_complete() {
+        let cfg = Config::parse(r#"repos = ["acme/one", "other-org/lib"]"#).unwrap();
+        let now = Utc::now();
+        for cut_short in [false, true] {
+            let mut s = snapshot(&cfg);
+            let mut found = Found::default();
+            let both = open(&["acme/old", "other-org/old"]);
+            apply_search(&mut found, &cfg, &mut s, &both, &[]);
+            let state = AppState {
+                config: Mutex::new(cfg.clone()),
+                config_mtime: Mutex::new(None),
+                snapshot: Mutex::new(s),
+                cache: None,
+                refresh_tx: Mutex::new(None),
+                window_state: Mutex::new(None),
+                window_dirty: AtomicBool::new(false),
+            };
+            for _ in 0..MISSES {
+                let acme = next_owner(&mut found, &cfg, now).unwrap();
+                let result = if cut_short {
+                    Ok(OpenPrs {
+                        complete: false,
+                        ..open(&[])
+                    })
+                } else {
+                    Err(GhError::GraphQl("cannot be searched".into()))
+                };
+                record(&state, &mut found, &acme, result, None, now);
+                let other = next_owner(&mut found, &cfg, now).unwrap();
+                record(&state, &mut found, &other, Ok(open(&[])), None, now);
+                assert!(found.round.is_none(), "the round ends");
+            }
+            let s = rows(&state.snapshot.lock().unwrap());
+            let left = ["acme/one", "other-org/lib", "acme/old (added)"];
+            assert_eq!(s, left, "acme's search cut short: {cut_short}");
+        }
     }
 
     #[test]
