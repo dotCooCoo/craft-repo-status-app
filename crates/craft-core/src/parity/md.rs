@@ -127,16 +127,32 @@ impl Doc {
     pub fn parse(path: &str, text: &str) -> Doc {
         let text = clean(text);
         let mut lines = Vec::new();
-        let mut fence = false;
+        // The open fence's marker character and length. It closes on a line
+        // of the same character, at least as long, with nothing after it.
+        let mut fence: Option<(char, usize)> = None;
         let mut h1 = false;
         let last_line = text.split('\n').count() as u32;
         for (i, line) in text.split('\n').enumerate() {
             let lead = line.trim_start();
-            if lead.starts_with("```") || lead.starts_with("~~~") {
-                fence = !fence;
-                continue;
+            if let Some(m) = lead.chars().next().filter(|c| *c == '`' || *c == '~') {
+                let n = lead.chars().take_while(|c| *c == m).count();
+                let rest = &lead[n..];
+                if n >= 3 {
+                    match fence {
+                        // A backtick fence's info string holds no backtick.
+                        None if m == '~' || !rest.contains('`') => {
+                            fence = Some((m, n));
+                            continue;
+                        }
+                        Some((fm, fl)) if fm == m && n >= fl && rest.trim().is_empty() => {
+                            fence = None;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
             }
-            if fence {
+            if fence.is_some() {
                 continue;
             }
             if heading(line).is_some_and(|(level, _)| level == 1) {
@@ -783,6 +799,20 @@ mod tests {
         let names: Vec<&str> = doc.headings.iter().map(|h| h.text.as_str()).collect();
         assert_eq!(names, ["A", "Shown"]);
         assert_eq!(doc.last_line, 8);
+    }
+
+    #[test]
+    fn a_fence_closes_only_on_its_own_marker() {
+        for md in [
+            "# A\n````\n```\n## Hidden\n```\n````\n## Shown\n",
+            "# A\n```\n~~~\n## Hidden\n```\n## Shown\n",
+            "# A\n```\n```md\n## Hidden\n```\n## Shown\n",
+            "# A\n``` a`b\n## Shown\n",
+        ] {
+            let doc = Doc::parse("d.md", md);
+            let names: Vec<&str> = doc.headings.iter().map(|h| h.text.as_str()).collect();
+            assert_eq!(names, ["A", "Shown"], "{md:?}");
+        }
     }
 
     #[test]
