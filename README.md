@@ -63,7 +63,7 @@ sort by a column again.
 - **The Parity tab** (`⌘3`) shows each app's parity with its target app, read
   from the same two documents plus `docs/gaps.md`, the machine checklists
   (`docs/parity-checklist.md`, `docs/scorecard.md`, `parity/*.toml` and the
-  documents the Feature breadth row links to) and every `docs/*-parity.md`.
+  documents the Feature breadth rows link to) and every `docs/*-parity.md`.
   The **Apps** view has a row per app: its stage; Ready, for the full target,
   mainstream users or essentials (picked in the header), with its range and a
   tick at Breadth; the hours to beta and to full parity; the dimension that
@@ -143,8 +143,8 @@ scored.
   downloads their text, in one more GraphQL request, only when one of them has
   changed since the parity numbers were read, and keeps the numbers in the
   cache. One more request reads the last commit to each document, and
-  another reads the documents the Feature breadth row links to that are not
-  in that list. A repo whose Feature breadth row links to such a document is
+  another reads the documents the Feature breadth rows link to that are not
+  in that list. A repo whose Feature breadth rows link to such a document is
   read again after each new commit to its default branch. While fewer than
   1,500 points remain, it waits, and the Parity columns and tab keep their
   previous numbers.

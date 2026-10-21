@@ -203,7 +203,7 @@ pub fn read(out: &mut Parity, files: &[Input], docs: &[&Doc]) {
     }
 }
 
-/// In-repo paths linked from the headline breadth row's Kind cell.
+/// In-repo paths linked from the headline breadth rows' Kind cells.
 pub fn linked_paths(out: &Parity) -> Vec<String> {
     out.breadth_links.clone()
 }

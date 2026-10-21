@@ -708,7 +708,8 @@ pub struct Parity {
     pub menu_breadth: Figure,
     /// A menu fraction in the breadth row, for comparing with the checklist.
     pub menu_hint: Option<Fraction>,
-    /// The in-repo paths the breadth row's Kind cell links to.
+    /// The in-repo paths the breadth rows' Kind cells link to, the shown
+    /// row's first.
     pub breadth_links: Vec<String>,
     pub mainstream: Figure,
     pub essentials: Figure,

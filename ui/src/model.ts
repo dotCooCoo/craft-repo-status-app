@@ -303,7 +303,7 @@ export interface Parity {
   breadth_alts: Figure[];
   menu_breadth: Figure;
   menu_hint: Fraction | null;
-  /** The in-repo paths the breadth row's Kind cell links to. */
+  /** The in-repo paths the breadth rows' Kind cells link to, the shown row's first. */
   breadth_links: string[];
   mainstream: Figure;
   essentials: Figure;

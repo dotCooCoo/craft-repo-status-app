@@ -342,10 +342,17 @@ pub fn headline(out: &mut Parity, rm: Option<&Doc>, tap: Option<&Doc>) {
                 .map(|(_, r)| r.figure(path, None, None))
                 .collect();
             let b = breadth[i];
-            // Each linked document once, though several sections are linked.
+            // Each document the breadth rows link to once, though several
+            // sections are linked: the shown row's first, then the others'.
             out.breadth_links = Vec::new();
-            for p in md::links(b.kind_raw)
-                .into_iter()
+            let others = breadth
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, r)| *r);
+            for p in std::iter::once(b)
+                .chain(others)
+                .flat_map(|r| md::links(r.kind_raw))
                 .filter_map(|(_, url)| super::dims::resolve(path, &url))
             {
                 if p != path && !out.breadth_links.contains(&p) {
@@ -914,6 +921,13 @@ mod tests {
                   | Feature breadth | 60% | measured: [menus](docs/menus.md#file) and [tools](docs/menus.md#tools), \
                   [this](#headline-numbers), [ui](docs/ui.md) |\n";
         assert_eq!(rm(md).breadth_links, ["docs/menus.md", "docs/ui.md"]);
+        // The shown row's links come first, then the other breadth rows'.
+        let md = "## Headline numbers\n\n| | Value | Kind |\n|---|---|---|\n\
+                  | Feature breadth (checklist) | 81% | measured: [checklist](docs/features.md) |\n\
+                  | Feature breadth (weighted) | 77% | estimated: [menus](docs/menus.md) |\n";
+        let p = rm(md);
+        assert_eq!(ok(&p.breadth).0, 77.0);
+        assert_eq!(p.breadth_links, ["docs/menus.md", "docs/features.md"]);
     }
 
     #[test]
