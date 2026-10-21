@@ -85,22 +85,27 @@ fn percents(s: &str) -> Vec<Found> {
 pub fn pct(raw: &str) -> Option<Pct> {
     let text = plain(raw);
     let all = percents(&text);
-    let range = PCT_RANGE.captures(&text).and_then(|c| {
-        if !starts_number(&text, c.get(1)?.start()) {
-            return None;
-        }
-        Some((c[1].parse().ok()?, c[2].parse().ok()?))
-    });
+    let ranges: Vec<(f64, f64)> = PCT_RANGE
+        .captures_iter(&text)
+        .filter_map(|c| {
+            if !starts_number(&text, c.get(1)?.start()) {
+                return None;
+            }
+            Some((c[1].parse().ok()?, c[2].parse().ok()?))
+        })
+        .collect();
     // `within` is the string `f`'s offsets index: the cell, or a bold span.
     let make = |f: &Found, within: &str| {
         let mut note = None;
         if within.get(f.end..).is_some_and(|s| s.starts_with('+')) {
             note = Some("or more".to_string());
         }
+        // The first range that holds the value.
+        let range = ranges.iter().find(|r| r.0 <= f.n && f.n <= r.1);
         Pct {
             value: f.n,
             approx: f.approx,
-            low: range.map(|r: (f64, f64)| r.0),
+            low: range.map(|r| r.0),
             high: range.map(|r| r.1),
             basis: Basis::Unknown,
             raw: text.clone(),
@@ -477,6 +482,11 @@ mod tests {
         let r = pct("**~62%** (57–67%)").unwrap();
         assert_eq!((r.low, r.high), (Some(57.0), Some(67.0)));
         assert_eq!(pct("**~45%** (P0 98%)").and_then(|r| r.low), None);
+        // A range goes with the value only when it holds the value.
+        assert_eq!(pct("**40%** (was 30–35%)").and_then(|r| r.low), None);
+        assert_eq!(pct("~62% (alpha 40–50%)").and_then(|r| r.high), None);
+        let r = pct("**~62%** (was 40–50%, now 57–67%)").unwrap();
+        assert_eq!((r.low, r.high), (Some(57.0), Some(67.0)));
     }
 
     #[test]

@@ -991,6 +991,16 @@ mod tests {
     }
 
     #[test]
+    fn a_headline_table_quoted_in_a_fence_is_not_read() {
+        let quoted = "## Headline numbers\n| | Value |\n|---|---|\n| Feature breadth | 11% |\n";
+        let real = "## Headline numbers\n| | Value |\n|---|---|\n| Feature breadth | 50% |\n";
+        for (open, inner, close) in [("````md", "```", "````"), ("```", "~~~", "```")] {
+            let md = format!("# R\n\n{open}\n{inner}\n{quoted}{inner}\n{close}\n\n{real}");
+            assert_eq!(ok(&rm(&md).breadth).0, 50.0, "{open} {inner}");
+        }
+    }
+
+    #[test]
     fn missing_parts_give_a_reason() {
         let p = rm("# Roadmap\n\nNothing here.\n");
         assert_eq!(why(&p.breadth), "No Headline numbers section in ROADMAP.md");
