@@ -501,6 +501,15 @@ fn repo(args: &Map<String, Value>, src: &Sources, now: Time) -> Result<Value, St
     Ok(Value::Object(out))
 }
 
+/// The names of `rec`'s failing checks while its rollup is `FAILURE` or
+/// `ERROR`, as the work states read them; none for any other rollup.
+fn failing_checks(rec: &PrRecord) -> Vec<String> {
+    match rec.checks.rollup.as_deref() {
+        Some("FAILURE" | "ERROR") => rec.checks.failing.clone(),
+        _ => Vec::new(),
+    }
+}
+
 /// One My PRs row with what the records say about its checks.
 fn mine_row(r: &MineRow, login: &str, d: &Data) -> Value {
     let i = &r.item;
@@ -527,7 +536,7 @@ fn mine_row(r: &MineRow, login: &str, d: &Data) -> Value {
         "state_label": rows::state_label(&i.work.state),
         "rule": i.work.rule,
         "guess": i.work.guess,
-        "failing_checks": rec.map(|r| r.checks.failing.clone()).unwrap_or_default(),
+        "failing_checks": rec.map(failing_checks).unwrap_or_default(),
         "checks_rollup": rec.and_then(|r| r.checks.rollup.clone()),
         "mergeable": rec.and_then(|r| nonempty(&r.checks.mergeable)),
         "merge_state": rec.and_then(|r| nonempty(&r.checks.merge_state)),
@@ -676,7 +685,7 @@ fn pull_request(args: &Map<String, Value>, src: &Sources, now: Time) -> Result<V
             "mergeable": rec.checks.mergeable,
             "merge_state": rec.checks.merge_state,
             "rollup": rec.checks.rollup,
-            "failing": rec.checks.failing,
+            "failing": failing_checks(rec),
         },
         "closing_issues": rec.closing_issues,
     }))

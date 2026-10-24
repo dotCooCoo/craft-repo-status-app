@@ -770,6 +770,26 @@ mod tests {
         cleanup(&src);
     }
 
+    #[test]
+    fn failing_checks_are_listed_only_while_the_rollup_has_failed() {
+        let src = fixture("recovered", Some("bo-example"));
+        // The checks failed, ran again and passed: the sweep read the new
+        // rollup but not the names.
+        let mut alpha = PrCache::load(&src.dir, "example-org/alpha");
+        let rec = alpha.records.get_mut(&3).unwrap();
+        rec.checks.rollup = Some("SUCCESS".into());
+        rec.checks.failing = vec!["build (macos)".into()];
+        alpha.save(&src.dir, "example-org/alpha").unwrap();
+        let s = server(&src);
+        let a = call(&s, "pull_request", json!({"repo": "alpha", "number": 3}));
+        assert_eq!(a["checks"]["rollup"], "SUCCESS");
+        assert_eq!(a["checks"]["failing"], json!([]));
+        let mine = call(&s, "my_prs", json!({}));
+        assert_eq!(mine["rows"][0]["number"], 3);
+        assert_eq!(mine["rows"][0]["failing_checks"], json!([]));
+        cleanup(&src);
+    }
+
     /// Every file under `dir` with its length, time and contents.
     fn tree(dir: &Path) -> BTreeMap<PathBuf, (u64, std::time::SystemTime, Vec<u8>)> {
         let mut out = BTreeMap::new();
