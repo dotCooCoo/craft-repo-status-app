@@ -894,13 +894,14 @@ fn update_people(
     let held: Vec<(&str, &PrCache)> = caches.iter().map(|(r, c)| (r.as_str(), c)).collect();
     let events = Ledger::build(&held).events.len();
     eprintln!(
-        "people in {:.1}s: {} requests ({} smaller retries), {} changed, {} repos swept, {} backfilled, {} merged read, {} closed read, {} file pages{}; {} records ({} to fetch), merged and closed walks done {}/{}; {} people, {} on the roster, {} roster rows not linked; {} events",
+        "people in {:.1}s: {} requests ({} smaller retries), {} changed, {} repos swept, {} backfilled, {} commit and check pages, {} merged read, {} closed read, {} file pages{}; {} records ({} to fetch), merged and closed walks done {}/{}; {} people, {} on the roster, {} roster rows not linked; {} events",
         started.elapsed().as_secs_f64(),
         report.requests,
         report.retries,
         report.changed,
         report.swept,
         report.backfilled,
+        report.list_pages,
         report.merged,
         report.closed,
         report.file_pages,
