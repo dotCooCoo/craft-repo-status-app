@@ -2,13 +2,13 @@
 // picks the Tauri API, or a browser stand-in, and calls `start`.
 
 import {
-  COLUMNS, RECENT, WINDOWS, MANUAL, windowById, value, orderedEntries, nextSort, dropIndex,
-  freshness, ago, totals, urgentAcross, tokenStatus, isRefreshing,
   PARITY_FIGURES, figurePct, formatPct, parityTip, parityUrl,
   AUDIENCES, BASIS_BADGE, GAP_KINDS, NO_GAP_FILTER, PARITY_COLUMNS, PARITY_WARN_DAYS, allGaps, areaStrip, areasByDrag,
   audienceFigure, betaUnknownWhy, blocksLabel, cellValue, changedAt, checklistSummary, daysSince, dimScore, dimsByDrag, docUrl,
   figureSrc, gapKinds, gapTotal, hasParity, heatMeans, heatOf, hoursText, kindSums, nextGapSort, parityBadge,
   parityNextSort, parityOrder, partText, reviewAgeDays, scoreText, sourceUrl, stageOf, sumText, whyMissing,
+  COLUMNS, RECENT, WINDOWS, MANUAL, windowById, value, orderedEntries, nextSort, dropIndex,
+  freshness, ago, totals, urgentAcross, tokenStatus, isRefreshing,
 } from './model.ts';
 import type {
   Column, Meta, RepoEntry, Snapshot, Sort, ParityField,
