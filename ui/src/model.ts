@@ -516,7 +516,11 @@ export function parityTip(p: Parity | null | undefined, field: ParityField): str
     lines.push(f.why);
     if (f.state === 'unreadable') lines.push(`${f.path} line ${f.line}: ${f.raw}`);
   }
-  if (p.roadmap_oid) lines.push(p.last_reviewed ? `ROADMAP.md last reviewed ${p.last_reviewed}` : 'ROADMAP.md has no Last reviewed date');
+  const src = f.state === 'absent' ? 'ROADMAP.md' : f.path;
+  if (src !== 'ROADMAP.md') {
+    const reviewed = p.files.find((x) => x.path === src)?.reviewed;
+    lines.push(reviewed ? `${src} last reviewed ${reviewed}` : `${src} has no Last reviewed date`);
+  } else if (p.roadmap_oid) lines.push(p.last_reviewed ? `ROADMAP.md last reviewed ${p.last_reviewed}` : 'ROADMAP.md has no Last reviewed date');
   if (p.parity_doc) lines.push('Click to open docs/target-app-parity.md on GitHub');
   else if (p.roadmap_oid) lines.push('Click to open ROADMAP.md on GitHub');
   return lines.join('\n');
