@@ -490,6 +490,17 @@ const BASIS_TEXT: Readonly<Record<Basis, string>> = {
   measured: 'Measured', partly: 'Partly measured', estimated: 'Estimated', unknown: 'Basis not stated',
 };
 
+/** The Last reviewed date of the file figure `f` was read from, for its tooltip; null without a ROADMAP.md to name. */
+function reviewLine(p: Parity, f: Figure): string | null {
+  const src = f.state === 'absent' ? 'ROADMAP.md' : f.path;
+  if (src !== 'ROADMAP.md') {
+    const reviewed = p.files.find((x) => x.path === src)?.reviewed;
+    return reviewed ? `${src} last reviewed ${reviewed}` : `${src} has no Last reviewed date`;
+  }
+  if (!p.roadmap_oid) return null;
+  return p.last_reviewed ? `ROADMAP.md last reviewed ${p.last_reviewed}` : 'ROADMAP.md has no Last reviewed date';
+}
+
 /**
  * Where a click on a parity cell goes: docs/target-app-parity.md on GitHub at
  * the commit read, or without that document the figure's row in ROADMAP.md,
@@ -516,11 +527,8 @@ export function parityTip(p: Parity | null | undefined, field: ParityField): str
     lines.push(f.why);
     if (f.state === 'unreadable') lines.push(`${f.path} line ${f.line}: ${f.raw}`);
   }
-  const src = f.state === 'absent' ? 'ROADMAP.md' : f.path;
-  if (src !== 'ROADMAP.md') {
-    const reviewed = p.files.find((x) => x.path === src)?.reviewed;
-    lines.push(reviewed ? `${src} last reviewed ${reviewed}` : `${src} has no Last reviewed date`);
-  } else if (p.roadmap_oid) lines.push(p.last_reviewed ? `ROADMAP.md last reviewed ${p.last_reviewed}` : 'ROADMAP.md has no Last reviewed date');
+  const review = reviewLine(p, f);
+  if (review) lines.push(review);
   if (p.parity_doc) lines.push('Click to open docs/target-app-parity.md on GitHub');
   else if (p.roadmap_oid) lines.push('Click to open ROADMAP.md on GitHub');
   return lines.join('\n');
