@@ -340,6 +340,8 @@ impl PrRecord {
         if new_head {
             self.checks.failing.clear();
             self.checks.contexts_cursor = None;
+            // The old head's commit pages are not read on.
+            self.contribution.commits_cursor = None;
         }
         // A check suite that failed, recovered or ran again changes the
         // failing names, though the rollup may stay failed.
@@ -398,15 +400,23 @@ impl PrRecord {
             new.contribution.files = std::mem::take(&mut self.contribution.files);
             new.contribution.files_cursor = self.contribution.files_cursor.take();
         }
-        // So do commit pages, while the kept list ends at the new head.
+        // So do commit pages: a whole list while it ends at the new head,
+        // and pages read part way while the new first page starts them.
         let (old, fresh) = (&self.contribution, &new.contribution);
         let ends_at_head = old
             .commits
             .last()
             .is_some_and(|k| k.oid == new.head_ref_oid);
+        let part_way = old.commits_cursor.is_some()
+            && self.head_ref_oid == new.head_ref_oid
+            && old
+                .commits
+                .iter()
+                .zip(&fresh.commits)
+                .all(|(o, f)| o.oid == f.oid);
         if old.commits.len() > fresh.commits.len()
             && old.commits_total == fresh.commits_total
-            && ends_at_head
+            && (ends_at_head || part_way)
         {
             new.contribution.commits = std::mem::take(&mut self.contribution.commits);
             new.contribution.commits_cursor = self.contribution.commits_cursor.take();
