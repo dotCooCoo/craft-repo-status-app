@@ -1495,7 +1495,10 @@ fn open_state(f: &Facts) -> WorkState {
                 .iter()
                 .filter(|n| !main_failing.contains(n))
                 .collect();
-            let inherited = !r.checks.failing.is_empty() && own.is_empty();
+            // Until the rest of a long check list is read, a check of the
+            // pull request's own may be failing among the unread ones.
+            let cut = r.checks.contexts_cursor.is_some();
+            let inherited = !r.checks.failing.is_empty() && own.is_empty() && !cut;
             let names = r.checks.failing.join(", ");
             // The newest suite on the head started the run that failed.
             let since = r.checks.suites.iter().filter_map(|s| s.created_at).max();
@@ -1515,7 +1518,7 @@ fn open_state(f: &Facts) -> WorkState {
                     waits: vec![Role::Author],
                     waits_for: f.author_vec(),
                     since,
-                    low: ctx.main.is_none(),
+                    low: ctx.main.is_none() || cut,
                     rule: format!("52: checks fail that pass on main ({names})"),
                     ..Default::default()
                 });
@@ -2132,7 +2135,8 @@ fn closed_state(f: &Facts) -> WorkState {
 #[cfg(test)]
 mod tests {
     use super::super::record::{
-        Checks, Closer, Contribution, CrossSource, MergeCommit, PrCommit, Suite, TimelineItem,
+        Checks, Closer, ContextsCursor, Contribution, CrossSource, MergeCommit, PrCommit, Suite,
+        TimelineItem,
     };
     use super::*;
 
@@ -2863,6 +2867,11 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(w.state(&r).state, "ci_failing_inherited_from_main");
+        // A check list not read in full may hide a failure of its own.
+        let mut cut = r.clone();
+        cut.checks.contexts_cursor = Some(ContextsCursor::default());
+        let s = w.state(&cut);
+        assert_eq!((s.state.as_str(), s.low), ("ci_failing_from_pr", true));
         w.main = Some(MainChecks::default());
         let s = w.state(&r);
         assert_eq!(s.state, "ci_failing_from_pr");
