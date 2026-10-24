@@ -726,6 +726,9 @@ test('opening a caret asks for that person’s tables in the current window', as
   detail().querySelector<HTMLButtonElement>('.dir-toggle')!.click();
   assert.ok(detail().querySelector('tr.sub .module'));
   assert.match(detail().textContent!, /tools/);
+  // A second click closes it.
+  detail().querySelector<HTMLButtonElement>('.dir-toggle')!.click();
+  assert.equal(detail().textContent!.includes('tools'), false);
   // The window picker asks again with the new window; the same answer is not asked twice.
   pick(h, 'people-window', '1d');
   assert.deepEqual(hostCalls(h).at(-1), { cmd: 'person_detail', args: { login: 'ann-example', window: '1d' } });
@@ -736,6 +739,10 @@ test('opening a caret asks for that person’s tables in the current window', as
   h.emit('craft:people', people());
   assert.deepEqual(hostCalls(h).at(-1), { cmd: 'person_detail', args: { login: 'ann-example', window: '7d' } });
   assert.match(detail().textContent!, /^3 merged pull requests/);
+  // A second click on the caret closes the detail row.
+  caretOf('ann-example').click();
+  assert.ok(!h.doc.querySelector('#rank-table tr.detail[data-key="ann-example"]'), 'the detail row is gone');
+  assert.equal(caretOf('ann-example').getAttribute('aria-expanded'), 'false');
 });
 
 test('an answer asked for before a new People view is dropped, and the caret asks again', async () => {
