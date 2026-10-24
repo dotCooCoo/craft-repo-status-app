@@ -54,6 +54,23 @@ struct Round {
     incomplete: Vec<String>,
 }
 
+/// A search that failed, by the request that failed.
+#[derive(Debug)]
+enum SearchError {
+    /// Reading the token, or the login of its user, failed.
+    Token(GhError),
+    /// The search of the owner's pull requests failed.
+    Owner(GhError),
+}
+
+impl SearchError {
+    fn error(&self) -> &GhError {
+        match self {
+            SearchError::Token(e) | SearchError::Owner(e) => e,
+        }
+    }
+}
+
 /// Keep: writes an added row's repo into the config's `repos`.
 #[tauri::command]
 pub fn keep_repo(app: AppHandle, repo: String) -> Result<(), String> {
@@ -108,7 +125,7 @@ pub fn discover(app: &AppHandle, pacing: &mut Pacing, found: &mut Found) {
     };
     let result = search(&cfg, found, &owner);
     let now = Utc::now();
-    let msg = pace(pacing, result.as_ref().err(), now);
+    let msg = pace(pacing, result.as_ref().err().map(SearchError::error), now);
     record(&state, found, &owner, result, msg, now);
     emit_snapshot(app);
 }
@@ -119,7 +136,7 @@ fn record(
     state: &AppState,
     found: &mut Found,
     owner: &str,
-    result: Result<OpenPrs, GhError>,
+    result: Result<OpenPrs, SearchError>,
     msg: Option<String>,
     now: DateTime<Utc>,
 ) {
@@ -134,11 +151,13 @@ fn record(
             }
             searched(found, one)
         }
-        Err(e @ (GhError::GraphQl(_) | GhError::NotFound | GhError::Http(422, _))) => {
+        Err(SearchError::Owner(
+            e @ (GhError::GraphQl(_) | GhError::NotFound | GhError::Http(422, _)),
+        )) => {
             eprintln!("open pull request search for {owner}: {e}");
             failed(found)
         }
-        Err(e) => {
+        Err(SearchError::Token(e) | SearchError::Owner(e)) => {
             eprintln!("open pull request search for {owner}: {e}");
             // The next round starts over, after the token problem `step`
             // reports or a wait like a failed repo's.
@@ -172,11 +191,11 @@ fn record(
 
 /// The repos of `owner` where the token's user has an open pull request.
 /// The login is read once per token.
-fn search(cfg: &Config, found: &mut Found, owner: &str) -> Result<OpenPrs, GhError> {
-    let token = resolve_token(&cfg.github_token)?;
-    let gh = GitHub::new(token.value.clone())?;
-    let login = login(found, &token.value, || gh.token_login())?;
-    gh.open_pr_repos(&login, owner)
+fn search(cfg: &Config, found: &mut Found, owner: &str) -> Result<OpenPrs, SearchError> {
+    let token = resolve_token(&cfg.github_token).map_err(SearchError::Token)?;
+    let gh = GitHub::new(token.value.clone()).map_err(SearchError::Token)?;
+    let login = login(found, &token.value, || gh.token_login()).map_err(SearchError::Token)?;
+    gh.open_pr_repos(&login, owner).map_err(SearchError::Owner)
 }
 
 /// The owner to search next, starting a round over the configured owners
@@ -536,7 +555,8 @@ mod tests {
         let invalid = GhError::Http(422, "Validation Failed".into());
         for error in [refused, GhError::NotFound, invalid] {
             let acme = next_owner(&mut found, &cfg, now).unwrap();
-            record(&state, &mut found, &acme, Err(error), None, now);
+            let result = Err(SearchError::Owner(error));
+            record(&state, &mut found, &acme, result, None, now);
             assert!(found.round.is_some(), "the round goes on");
             let other = next_owner(&mut found, &cfg, now).unwrap();
             assert_eq!(other, "other-org");
@@ -556,11 +576,42 @@ mod tests {
         assert_eq!(s, all, "a round with a failed search is no miss");
 
         let acme = next_owner(&mut found, &cfg, now).unwrap();
-        let down = GhError::Http(502, "bad gateway".into());
+        let down = SearchError::Owner(GhError::Http(502, "bad gateway".into()));
         record(&state, &mut found, &acme, Err(down), None, now);
         assert!(found.round.is_none(), "any other error starts over");
         let retry = Some(now + CDuration::seconds(REPO_RETRY));
         assert_eq!(found.next_at, retry);
+    }
+
+    #[test]
+    fn a_failed_login_read_starts_the_round_over() {
+        let cfg = Config::parse(r#"repos = ["acme/one", "other-org/lib"]"#).unwrap();
+        let mut s = snapshot(&cfg);
+        let mut found = Found::default();
+        apply_search(&mut found, &cfg, &mut s, &open(&["acme/old"]), &[]);
+        let state = AppState {
+            config: Mutex::new(cfg.clone()),
+            config_mtime: Mutex::new(None),
+            snapshot: Mutex::new(s),
+            cache: None,
+            refresh_tx: Mutex::new(None),
+            window_state: Mutex::new(None),
+            window_dirty: AtomicBool::new(false),
+        };
+        let now = Utc::now();
+        let no_login = GhError::GraphQl("no viewer.login".into());
+        let invalid = GhError::Http(422, "Validation Failed".into());
+        for error in [no_login, GhError::NotFound, invalid] {
+            let acme = next_owner(&mut found, &cfg, now).unwrap();
+            let result = Err(SearchError::Token(error));
+            record(&state, &mut found, &acme, result, None, now);
+            assert!(found.round.is_none(), "the round starts over");
+            let retry = Some(now + CDuration::seconds(REPO_RETRY));
+            assert_eq!(found.next_at, retry);
+        }
+        let s = rows(&state.snapshot.lock().unwrap());
+        let all = ["acme/one", "other-org/lib", "acme/old (added)"];
+        assert_eq!(s, all, "no round ended");
     }
 
     #[test]
@@ -589,7 +640,8 @@ mod tests {
                         ..open(&[])
                     })
                 } else {
-                    Err(GhError::GraphQl("cannot be searched".into()))
+                    let refused = GhError::GraphQl("cannot be searched".into());
+                    Err(SearchError::Owner(refused))
                 };
                 record(&state, &mut found, &acme, result, None, now);
                 let other = next_owner(&mut found, &cfg, now).unwrap();
