@@ -4,24 +4,19 @@
 import {
   COLUMNS, RECENT, WINDOWS, MANUAL, windowById, value, orderedEntries, nextSort, dropIndex,
   freshness, ago, totals, urgentAcross, tokenStatus, isRefreshing,
-} from './model.ts';
-import type { Column, Meta, RepoEntry, Snapshot, Sort } from './model.ts';
-import {
   NOT_READ_YET, PEOPLE_COLUMNS, ROLE_LABELS, roleHeading, peopleRows, personFigures, personRepos, nextPeopleSort, repoItems,
   stateBreakdown, stateLabel, stateTip, countText, fromTextTip, durationText, waitsOn, heldCount, cachedText, recordsAge,
   RANK_MODES, RANK_COLUMNS, TYPES, PRODUCT, rankRows, nextRankSort, rankSortFor, linesText, guessTip, batchText,
   BATCH_TIP, UNVERIFIED_TIP, DIRECT_MISSING_TIP, RELEASE_TIP, TIME_NOTE, workLead, repoFigures,
-} from './model.ts';
-import type {
-  DetailRow, Item, PeopleView, PersonDetail, PersonFigures, PersonRow, Rank, RankColumn, RankMode, RankRow, RepoPeople,
-  StateTime, WorkState,
-} from './model.ts';
-import { MINE_COLUMNS, heldTip, mineRows, mineValue, myLogin, nextMineSort, replyTip, waitsText } from './model.ts';
-import type { MineRow } from './model.ts';
-import {
+  MINE_COLUMNS, heldTip, mineRows, mineValue, myLogin, nextMineSort, replyTip, waitsText, prRefs,
   TRACK_COLUMNS, TRACK_HINT, eventLabel, eventText, levelLabel, levelTip, pctText, peopleModeIn, peopleModeOf, trackBar, trackRows,
 } from './model.ts';
-import type { PeopleMode, TrackEvent, TrackRecord, TrackRow } from './model.ts';
+import type {
+  Column, Meta, RepoEntry, Snapshot, Sort,
+  DetailRow, Flow, Given, Item, MainChecks, PeopleView, PersonDetail, PersonFigures, PersonResponse, PersonRow, Rank, RankColumn, RankMode, RankRow,
+  RepoFigures, RepoFlow, RepoPeople,
+  StateTime, WorkState, MineRow, PeopleMode, TrackEvent, TrackRecord, TrackRow,
+} from './model.ts';
 
 /** What the UI needs from the host: Tauri commands and events, window chrome. */
 export interface Api {
@@ -108,6 +103,141 @@ const gh = (repo: string, path = ''): string => `https://github.com/${repo}${pat
 const shortName = (repo: string): string => repo.split('/').pop() ?? repo;
 const classes = (...cs: (string | false | null | undefined)[]): string => cs.filter(Boolean).join(' ');
 const DAY = 86400e3;
+
+// ───────────────────────────── people text ─────────────────────────────
+// The lines, cells and hints of the People tab, My PRs and the Repos
+// table's carets that need none of the UI's state.
+
+/** How long an item has been in its state: "3h in state", or for an item not read yet when GitHub last saw it change. */
+function stateAge(i: Item, now: number): string {
+  if (!i.work.since) return 'time in state unknown';
+  const a = ago(i.work.since, now);
+  if (i.work.state !== NOT_READ_YET) return `${a} in state`;
+  return a === 'now' ? 'updated just now' : `updated ${a} ago`;
+}
+
+/** The time a state's items have spent in it, for a person's breakdown. */
+function stateAgeNote(s: StateTime): string {
+  if (s.state === NOT_READ_YET) return 'their work state comes when the app reads them';
+  if (s.medianSecs === null) return 'time in this state unknown';
+  return `median ${durationText(s.medianSecs)}, longest ${durationText(s.maxSecs)} in this state`;
+}
+
+/** Gives the focus back to the element under `scope` whose `data-focus` key is `focused`. */
+function refocus(scope: string, focused: string | undefined): void {
+  if (focused) [...document.querySelectorAll<HTMLElement>(`${scope} [data-focus]`)].find((n) => n.dataset.focus === focused)?.focus();
+}
+
+/** The hint under the People tab's toolbar for sub-view `mode`. */
+function peopleHint(mode: PeopleMode): string {
+  if (mode === 'track') return TRACK_HINT;
+  if (mode === 'rankings') return '? marks a type set by a fallback rule, * an unverified count. Hover a header for what it counts.';
+  return 'Dotted states were read from comment text, not from GitHub fields; ? marks low confidence. Hover a state for its rule and sentence.';
+}
+
+/** A section of a detail: a heading and what follows it. */
+const detailSection = (title: string, ...kids: (Node | string | null | false)[]): HTMLElement => el('div', {}, el('h4', {}, title), ...kids);
+/** The muted line a detail section shows when it has nothing. */
+const noneLine = (text: string): HTMLElement => el('p', { class: 'muted small' }, text);
+/** A line of a detail as a small paragraph. */
+const smallLine = (text: string): HTMLElement => el('p', { class: 'small' }, text);
+/** `lines` as small paragraphs, or `none` as a muted line when there are none. */
+const smallLines = (lines: readonly string[], none: string): HTMLElement[] => (lines.length ? lines.map(smallLine) : [noneLine(none)]);
+
+/** A repo's open pull requests that wait on one role: the count, its share and the count in each state. */
+function roleLine(g: RepoFigures['byRole'][number]): string {
+  const states = g.states.map((s) => `${stateLabel(s.state)} ${s.count}`).join(', ');
+  return `${roleHeading(g.role)}: ${num(g.count)} (${Math.round(g.share * 100)}%). ${states}.`;
+}
+
+/** `rec` as "label count" pairs with the counts formatted; the label defaults to the key with spaces for underscores. */
+const repoParts = (rec: Record<string, number>, label: (k: string) => string = (k) => k.replaceAll('_', ' ')): string =>
+  Object.entries(rec).map(([k, n]) => `${label(k)} ${num(n)}`).join(', ');
+
+/** The checks on a repo's main: their rollup and the failing ones, or that they have not been read. */
+function mainChecksLine(main: MainChecks | null): string {
+  if (!main) return 'The checks on main have not been read yet.';
+  const rollup = main.rollup ? main.rollup.toLowerCase() : 'none reported';
+  const failing = main.failing.length ? `, failing ${main.failing.join(', ')}` : '';
+  return `Checks on main: ${rollup}${failing}.`;
+}
+
+/** Where a repo's pull requests went in the window: merges and by whom, closes, the median times, and merge methods and mergers. */
+function repoFlowLines(fl: RepoFlow): string[] {
+  const by = fl.merged ? ` (${repoParts(fl.merged_by)})` : '';
+  return [
+    `Merged ${num(fl.merged)}${by}, landed elsewhere ${num(fl.landed_elsewhere)}.`,
+    Object.keys(fl.closed).length ? `Closed without merging: ${repoParts(fl.closed, stateLabel)}.` : '',
+    `Median ${durationText(fl.median_merge_secs) || 'unknown'} to merge, ${durationText(fl.median_response_secs) || 'unknown'} to the first maintainer response.`,
+    fl.merged ? `Merge method: ${repoParts(fl.methods, (k) => k)}. Mergers: ${repoParts(fl.mergers, (k) => k)}.` : '',
+  ].filter(Boolean);
+}
+
+/** A person's responses: how they answer maintainer requests and how maintainers first respond to them. */
+function responseLines(r: PersonResponse, now: number): string[] {
+  const their = r.their_answered
+    ? `They answered ${num(r.their_answered)} maintainer requests in a median of ${durationText(r.their_median_secs)}.`
+    : 'They have no answered maintainer requests.';
+  const first = r.m_answered
+    ? `Maintainers first responded to ${num(r.m_answered)} of their pull requests in a median of ${durationText(r.m_median_secs)}.`
+    : 'No maintainer has responded to their pull requests yet.';
+  return [
+    their,
+    r.unanswered ? `${num(r.unanswered)} requests are unanswered; the oldest was made ${ago(r.oldest_unanswered, now)} ago.` : '',
+    first,
+    r.awaiting_first ? `${num(r.awaiting_first)} await a first response; the oldest has waited ${ago(r.oldest_awaiting, now)}.` : '',
+  ].filter(Boolean);
+}
+
+/** The reviews a person gave, with a maintainer's requests, holds, merges and closes. */
+function givenLines(g: Given, maintainer: boolean): string[] {
+  return [
+    `${num(g.comments)} comments and ${num(g.reviews)} reviews on ${num(g.prs)} pull requests: ${num(g.approved)} approvals, ${num(g.changes_requested)} change requests.`,
+    maintainer ? `${num(g.requests)} requests, ${num(g.holds)} holds, ${num(g.merges)} merges and ${num(g.closes)} closes.` : '',
+  ].filter(Boolean);
+}
+
+/** The name of a detail table row: a module under its directory, or a row with an empty caret (`blank`) that lines it up with the directories that open. */
+function detailName(name: string, sub: boolean, blank: boolean): HTMLElement {
+  return el('span', { class: sub ? 'module' : '' }, blank ? el('span', { class: 'tw', 'aria-hidden': 'true' }) : null, name);
+}
+
+/** A count, muted when it is zero. */
+const plainCount = (n: number): HTMLElement => el('span', { class: n ? '' : 'zero' }, num(n));
+
+/** A ranking's lines cell, flagged with a note when stacked or cut-short pull requests make the count incomplete. */
+function rankLines(r: Rank): HTMLElement {
+  const notes = [
+    r.stacked ? `${r.stacked} merged pull requests credit no lines: every commit was counted in an earlier one (stacked).` : '',
+    r.truncated ? `${r.truncated} merged pull requests have a commit, file or review list the fetch cut short. Over 100 commits credit every line to the author; a file list not read in full counts its unread lines as product lines.` : '',
+  ].filter(Boolean).join('\n');
+  return el('span', { class: notes ? 'flagged' : '', title: notes || null }, linesText(r.added, r.removed));
+}
+
+/** A ranking cell for a `type:` column, with a ? when a fallback rule set some of the count, or for any other numeric column. */
+function rankOther(key: string, r: Rank): HTMLElement {
+  if (key.startsWith('type:')) {
+    const t = key.slice(5);
+    const n = r.types[t] ?? 0;
+    const g = r.guessed[t] ?? 0;
+    return el('span', {}, plainCount(n), g ? el('span', { class: 'q', title: guessTip(t, n, g) }, '?') : null);
+  }
+  const v = (r as unknown as Record<string, unknown>)[key];
+  return plainCount(typeof v === 'number' ? v : 0);
+}
+
+/** `rec` as "label count" pairs. */
+const countParts = (rec: Record<string, number>, label: (k: string) => string): string => Object.entries(rec).map(([k, n]) => `${label(k)} ${n}`).join(', ');
+
+/** Where a person's pull requests went: merged and by whom, landed elsewhere, closed, and the time to merge. */
+function personFlowLines(fl: Flow): string[] {
+  const by = fl.merged ? ` (${countParts(fl.merged_by, (k) => k.replaceAll('_', ' '))})` : '';
+  return [
+    `Merged ${num(fl.merged)}${by}, landed elsewhere ${num(fl.landed_elsewhere)}.`,
+    Object.keys(fl.closed).length ? `Closed without merging: ${countParts(fl.closed, stateLabel)}.` : '',
+    fl.median_merge_secs === null ? '' : `Median ${durationText(fl.median_merge_secs)} to merge, ${durationText(fl.median_ready_secs)} from ready.`,
+  ].filter(Boolean);
+}
 
 /** The toolbar's refresh arrow, as an element (SVG needs its namespace). */
 function refreshIcon(): SVGSVGElement {
@@ -451,17 +581,11 @@ export function start(api: Api): () => void {
 
   /** A count cell: dotted, with the part read from comment text, when there is one. */
   function countCell(n: number, guessed: number): HTMLElement {
+    const plain = n ? '' : 'zero';
     return el('span', {
-      class: guessed ? 'guess-count' : n ? '' : 'zero',
+      class: guessed ? 'guess-count' : plain,
       title: guessed ? fromTextTip(n, guessed) : null,
     }, countText(n, guessed));
-  }
-
-  /** How long an item has been in its state: "3h in state", or for an item not read yet when GitHub last saw it change. */
-  function stateAge(i: Item, now: number): string {
-    if (!i.work.since) return 'time in state unknown';
-    const a = ago(i.work.since, now);
-    return i.work.state === NOT_READ_YET ? `updated ${a === 'now' ? 'just now' : `${a} ago`}` : `${a} in state`;
   }
 
   function itemLine(i: Item, now: number, withAuthor = false): HTMLElement {
@@ -471,20 +595,25 @@ export function start(api: Api): () => void {
       ' ', stateChip(i.work));
   }
 
+  /** A person's first cell: the caret that opens their repos, their login and their name. */
+  function personCell(p: PersonRow, open: boolean): HTMLTableCellElement {
+    return el('td', { class: 'person' },
+      el('button', {
+        class: 'caret',
+        'aria-expanded': String(open),
+        'aria-label': `${open ? 'Hide' : 'Show'} ${p.login} by repo`,
+        dataset: { focus: `caret:${p.key}` },
+        onclick: () => togglePerson(p.key),
+      }, open ? '▾' : '▸'),
+      link(p.login, `https://github.com/${p.login}`, 'who'),
+      p.name ? el('span', { class: 'name', title: p.name }, p.name) : null);
+  }
+
   function personRow(f: PersonFigures, p: PersonRow, open: boolean, repo = ''): HTMLTableRowElement {
     const entry = state.snap?.repos.find((e) => e.repo === repo);
     const first = repo
       ? el('td', { class: 'person' }, appIcon(entry ?? { repo }), ' ', shortName(repo))
-      : el('td', { class: 'person' },
-        el('button', {
-          class: 'caret',
-          'aria-expanded': String(open),
-          'aria-label': `${open ? 'Hide' : 'Show'} ${p.login} by repo`,
-          dataset: { focus: `caret:${p.key}` },
-          onclick: () => togglePerson(p.key),
-        }, open ? '▾' : '▸'),
-        link(p.login, `https://github.com/${p.login}`, 'who'),
-        p.name ? el('span', { class: 'name', title: p.name }, p.name) : null);
+      : personCell(p, open);
     const others = Object.entries(f.onOthers).map(([role, n]) => `${ROLE_LABELS[role as keyof typeof ROLE_LABELS]} ${n}`).join(', ');
     const plain = (n: number) => el('span', { class: n ? '' : 'zero' }, num(n));
     const cells: Node[] = [
@@ -508,63 +637,47 @@ export function start(api: Api): () => void {
   function personDetail(v: PeopleView, p: PersonRow, f: PersonFigures, now: number, repo: string): HTMLElement {
     const items = repoItems(v, repo);
     const own = items.filter((i) => i.author === p.key);
-    const section = (title: string, ...kids: (Node | string | null | false)[]) => el('div', {}, el('h4', {}, title), ...kids);
-    const none = (text: string) => el('p', { class: 'muted small' }, text);
+    const theirs = items.filter((i) => i.author !== p.key && waitsOn(i, p.key));
+    const holds = own.filter((i) => i.work.hold);
+    const parked = own.filter((i) => i.work.state === 'author_declared_hold');
+    const responses = f.response ? responseLines(f.response, now) : [];
+    const maintainer = p.maintainer_of.length > 0;
+    const given = f.given ? givenLines(f.given, maintainer) : [];
+    if (maintainer) {
+      const answeredQueue = items.filter((i) => i.work.state === 'author_responded_awaiting_maintainer' && waitsOn(i, p.key)).length;
+      given.push(`${num(answeredQueue)} authors have answered their requests and wait on them.`);
+    }
+    const flow = f.flow ? personFlowLines(f.flow) : [];
+    const windowLabel = windowById(state.peopleWindow).label.toLowerCase();
+    const where = repo ? `Where their work went in ${shortName(repo)}` : 'Where their work went';
+    return el('div', { class: 'person-detail' },
+      detailSection('Open work by state', ...stateGroups(own, now)),
+      detailSection('Waiting on them', theirs.length ? el('div', {}, theirs.map((i) => itemLine(i, now, true))) : noneLine('Nothing else waits on them.')),
+      detailSection('Held for the owner',
+        holds.length ? el('div', {}, holds.map((i) => holdLine(i, now))) : noneLine('None of their pull requests is held.'),
+        parked.length ? el('div', {}, el('div', { class: 'muted small' }, 'Parked by them pending a decision'), parked.map((i) => itemLine(i, now))) : null),
+      detailSection('Responses', ...smallLines(responses, 'No pull requests.')),
+      detailSection(`Reviews given, ${windowLabel}`, ...smallLines(given, 'None in this window.')),
+      detailSection(`Flow, ${windowLabel}`, ...smallLines(flow, 'Nothing merged or closed in this window.')),
+      el('div', { class: 'wide' }, el('h4', {}, `${where}, ${windowLabel}`), personTables(p.key, repo)));
+  }
+
+  /** A person's open work grouped by who it waits on and by state, with time in state and the oldest items. */
+  function stateGroups(own: readonly Item[], now: number): HTMLElement[] {
     const groups = stateBreakdown(own, now).map((g) => el('div', {},
       el('div', { class: 'muted small' }, roleHeading(g.role)),
       el('ul', {}, g.states.map((s) => el('li', {},
         el('div', { class: 'state-line' }, stateGroupChip(s), el('span', {}, countText(s.items.length, s.guessed)),
-          el('span', { class: 'muted' }, s.state === NOT_READ_YET
-            ? 'their work state comes when the app reads them'
-            : s.medianSecs === null
-              ? 'time in this state unknown'
-              : `median ${durationText(s.medianSecs)}, longest ${durationText(s.maxSecs)} in this state`)),
+          el('span', { class: 'muted' }, stateAgeNote(s))),
         el('div', { class: 'oldest' }, s.oldest.map((i) => itemLine(i, now))))))));
-    const theirs = items.filter((i) => i.author !== p.key && waitsOn(i, p.key));
-    const holds = own.filter((i) => i.work.hold);
-    const parked = own.filter((i) => i.work.state === 'author_declared_hold');
-    const holdLine = (i: Item) => {
-      const h = i.work.hold!;
-      const bits = [`held ${ago(h.since, now)}`, h.by && `by ${h.by}`, h.category, h.reaffirmed && `held again ${ago(h.reaffirmed, now)} ago`];
-      return el('div', {}, link(`#${i.number}`, i.url), ' ', i.title, ' ', el('span', { class: 'muted' }, bits.filter(Boolean).join(', ')), ' ', stateChip(i.work));
-    };
-    const r = f.response;
-    const responses = r ? [
-      r.their_answered
-        ? `They answered ${num(r.their_answered)} maintainer requests in a median of ${durationText(r.their_median_secs)}.`
-        : 'They have no answered maintainer requests.',
-      r.unanswered ? `${num(r.unanswered)} requests are unanswered; the oldest was made ${ago(r.oldest_unanswered, now)} ago.` : '',
-      r.m_answered
-        ? `Maintainers first responded to ${num(r.m_answered)} of their pull requests in a median of ${durationText(r.m_median_secs)}.`
-        : 'No maintainer has responded to their pull requests yet.',
-      r.awaiting_first ? `${num(r.awaiting_first)} await a first response; the oldest has waited ${ago(r.oldest_awaiting, now)}.` : '',
-    ].filter(Boolean) : [];
-    const g = f.given;
-    const maintainer = p.maintainer_of.length > 0;
-    const answeredQueue = items.filter((i) => i.work.state === 'author_responded_awaiting_maintainer' && waitsOn(i, p.key)).length;
-    const given = g ? [
-      `${num(g.comments)} comments and ${num(g.reviews)} reviews on ${num(g.prs)} pull requests: ${num(g.approved)} approvals, ${num(g.changes_requested)} change requests.`,
-      maintainer ? `${num(g.requests)} requests, ${num(g.holds)} holds, ${num(g.merges)} merges and ${num(g.closes)} closes.` : '',
-    ].filter(Boolean) : [];
-    if (maintainer) given.push(`${num(answeredQueue)} authors have answered their requests and wait on them.`);
-    const fl = f.flow;
-    const parts = (rec: Record<string, number>, label: (k: string) => string) => Object.entries(rec).map(([k, n]) => `${label(k)} ${n}`).join(', ');
-    const flow = fl ? [
-      `Merged ${num(fl.merged)}${fl.merged ? ` (${parts(fl.merged_by, (k) => k.replaceAll('_', ' '))})` : ''}, landed elsewhere ${num(fl.landed_elsewhere)}.`,
-      Object.keys(fl.closed).length ? `Closed without merging: ${parts(fl.closed, stateLabel)}.` : '',
-      fl.median_merge_secs !== null ? `Median ${durationText(fl.median_merge_secs)} to merge, ${durationText(fl.median_ready_secs)} from ready.` : '',
-    ].filter(Boolean) : [];
-    const windowLabel = windowById(state.peopleWindow).label.toLowerCase();
-    return el('div', { class: 'person-detail' },
-      section('Open work by state', ...(groups.length ? groups : [none('No open pull requests.')])),
-      section('Waiting on them', theirs.length ? el('div', {}, theirs.map((i) => itemLine(i, now, true))) : none('Nothing else waits on them.')),
-      section('Held for the owner',
-        holds.length ? el('div', {}, holds.map(holdLine)) : none('None of their pull requests is held.'),
-        parked.length ? el('div', {}, el('div', { class: 'muted small' }, 'Parked by them pending a decision'), parked.map((i) => itemLine(i, now))) : null),
-      section('Responses', ...(responses.length ? responses.map((t) => el('p', { class: 'small' }, t)) : [none('No pull requests.')])),
-      section(`Reviews given, ${windowLabel}`, ...(given.length ? given.map((t) => el('p', { class: 'small' }, t)) : [none('None in this window.')])),
-      section(`Flow, ${windowLabel}`, ...(flow.length ? flow.map((t) => el('p', { class: 'small' }, t)) : [none('Nothing merged or closed in this window.')])),
-      el('div', { class: 'wide' }, el('h4', {}, `Where their work went${repo ? ` in ${shortName(repo)}` : ''}, ${windowLabel}`), personTables(p.key, repo)));
+    return groups.length ? groups : [noneLine('No open pull requests.')];
+  }
+
+  /** A held item: its link, title, how long and by whom it is held, and its state. */
+  function holdLine(i: Item, now: number): HTMLElement {
+    const h = i.work.hold!;
+    const bits = [`held ${ago(h.since, now)}`, h.by && `by ${h.by}`, h.category, h.reaffirmed && `held again ${ago(h.reaffirmed, now)} ago`];
+    return el('div', {}, link(`#${i.number}`, i.url), ' ', i.title, ' ', el('span', { class: 'muted' }, bits.filter(Boolean).join(', ')), ' ', stateChip(i.work));
   }
 
   function togglePerson(key: string): void {
@@ -626,6 +739,20 @@ export function start(api: Api): () => void {
       el('span', { class: 'share-bar' }, el('span', { class: 'share-fill', style: `width: ${pct}%` })), el('span', { class: 'share-pct' }, `${pct}%`));
   }
 
+  /** The caret and name of a directory row whose modules under src/ open under it; `openKey` is `dirOf|directory`. */
+  function dirToggle(openKey: string, name: string): HTMLElement {
+    const open = state.dirOpen.has(openKey);
+    return el('button', {
+      class: 'dir-toggle', 'aria-expanded': String(open), dataset: { focus: `dir:${openKey}` },
+      title: `${open ? 'Hide' : 'Show'} the modules under ${name}/src/`,
+      onclick: () => {
+        if (open) state.dirOpen.delete(openKey);
+        else state.dirOpen.add(openKey);
+        redrawPeople();
+      },
+    }, el('span', { class: 'tw', 'aria-hidden': 'true' }, open ? '▾' : '▸'), name);
+  }
+
   /** One of a person's detail tables. `repoCols` adds merges, reviews and review commits; `label` names a row. */
   function detailTable(title: string, list: readonly DetailRow[], opts: { repoCols?: boolean; label?: (k: string) => string; type?: boolean; dirOf?: string } = {}): HTMLElement {
     // [header, column class]; style.css gives each class a fixed width.
@@ -635,17 +762,9 @@ export function start(api: Api): () => void {
     const dirs = opts.dirOf !== undefined;
     const line = (r: DetailRow, sub: boolean) => {
       const name = opts.label?.(r.key) ?? r.key;
-      const openKey = `${opts.dirOf}|${r.key}`;
-      const open = state.dirOpen.has(openKey);
       // A directory with modules under src/ opens them; the others get an
       // empty caret of the same width.
-      const first = dirs && !sub && r.children.length
-        ? el('button', {
-          class: 'dir-toggle', 'aria-expanded': String(open), dataset: { focus: `dir:${openKey}` },
-          title: `${open ? 'Hide' : 'Show'} the modules under ${name}/src/`,
-          onclick: () => { if (open) state.dirOpen.delete(openKey); else state.dirOpen.add(openKey); redrawPeople(); },
-        }, el('span', { class: 'tw', 'aria-hidden': 'true' }, open ? '▾' : '▸'), name)
-        : el('span', { class: sub ? 'module' : '' }, dirs && !sub ? el('span', { class: 'tw', 'aria-hidden': 'true' }) : null, name);
+      const first = dirs && !sub && r.children.length ? dirToggle(`${opts.dirOf}|${r.key}`, name) : detailName(name, sub, dirs && !sub);
       const guess = opts.type && r.guessed ? el('span', { class: 'q', title: `${guessTip(r.key, r.merged, r.guessed)}\n${r.rules.join('\n')}` }, '?') : null;
       return el('tr', { class: sub ? 'sub' : '' },
         el('td', { title: [name, ...(opts.type ? [] : r.rules)].join('\n') }, first, guess),
@@ -684,44 +803,39 @@ export function start(api: Api): () => void {
   /** An unverified marker for a count from a batch-branch repository. */
   const unverified = (on: boolean) => (on ? el('span', { class: 'unverified', title: UNVERIFIED_TIP }, '*') : null);
 
+  /** The person cell of a ranking row: a caret that opens where their work went when `focusPrefix` is set, their login and name. */
+  function rankPerson(row: RankRow, open: boolean, focusPrefix: string): HTMLElement {
+    let caret: HTMLElement | null = null;
+    if (focusPrefix) {
+      caret = el('button', {
+        class: 'caret', 'aria-expanded': String(open), 'aria-label': `${open ? 'Hide' : 'Show'} where ${row.login}’s work went`,
+        dataset: { focus: `${focusPrefix}:${row.key}` },
+        onclick: () => {
+          if (state.rankOpen.has(row.key)) state.rankOpen.delete(row.key);
+          else state.rankOpen.add(row.key);
+          redrawPeople();
+        },
+      }, open ? '▾' : '▸');
+    }
+    return el('span', { class: 'person' }, caret,
+      link(row.login, `https://github.com/${row.login}`, 'who'),
+      row.name ? el('span', { class: 'name', title: row.name }, row.name) : null);
+  }
+
   /** The cell of ranking column `c` for a person with figures `r`. */
   function rankCell(c: RankColumn, row: RankRow, r: Rank, open: boolean, focusPrefix: string): Node {
-    const plain = (n: number) => el('span', { class: n ? '' : 'zero' }, num(n));
     switch (c.key) {
-      case 'person':
-        return el('span', { class: 'person' },
-          focusPrefix ? el('button', {
-            class: 'caret', 'aria-expanded': String(open), 'aria-label': `${open ? 'Hide' : 'Show'} where ${row.login}’s work went`,
-            dataset: { focus: `${focusPrefix}:${row.key}` },
-            onclick: () => { if (state.rankOpen.has(row.key)) state.rankOpen.delete(row.key); else state.rankOpen.add(row.key); redrawPeople(); },
-          }, open ? '▾' : '▸') : null,
-          link(row.login, `https://github.com/${row.login}`, 'who'),
-          row.name ? el('span', { class: 'name', title: row.name }, row.name) : null);
-      case 'merged': return el('span', {}, plain(r.merged), unverified(r.unverified && r.merged > 0));
-      case 'landed': return el('span', {}, plain(r.landed), unverified(r.unverified && r.landed > 0));
-      case 'lines': {
-        const notes = [
-          r.stacked ? `${r.stacked} merged pull requests credit no lines: every commit was counted in an earlier one (stacked).` : '',
-          r.truncated ? `${r.truncated} merged pull requests have a commit, file or review list the fetch cut short. Over 100 commits credit every line to the author; a file list not read in full counts its unread lines as product lines.` : '',
-        ].filter(Boolean).join('\n');
-        return el('span', { class: notes ? 'flagged' : '', title: notes || null }, linesText(r.added, r.removed));
-      }
+      case 'person': return rankPerson(row, open, focusPrefix);
+      case 'merged': return el('span', {}, plainCount(r.merged), unverified(r.unverified && r.merged > 0));
+      case 'landed': return el('span', {}, plainCount(r.landed), unverified(r.unverified && r.landed > 0));
+      case 'lines': return rankLines(r);
       case 'generated': return el('span', { class: r.gen_added + r.gen_removed ? '' : 'zero' }, linesText(r.gen_added, r.gen_removed));
       case 'review_lines': return el('span', { class: r.review_added + r.review_removed ? '' : 'zero' }, linesText(r.review_added, r.review_removed));
-      case 'direct': return r.direct === null ? el('span', { class: 'muted', title: DIRECT_MISSING_TIP }, '—') : plain(r.direct);
-      case 'merges': return el('span', {}, plain(r.merges), unverified(r.unverified && r.merges > 0),
+      case 'direct': return r.direct === null ? el('span', { class: 'muted', title: DIRECT_MISSING_TIP }, '—') : plainCount(r.direct);
+      case 'merges': return el('span', {}, plainCount(r.merges), unverified(r.unverified && r.merges > 0),
         r.batch_merges ? el('span', { class: 'batch', title: BATCH_TIP }, batchText(r)) : null);
-      case PRODUCT: return plain((r.types.feature ?? 0) + (r.types.fix ?? 0));
-      default: {
-        if (c.key.startsWith('type:')) {
-          const t = c.key.slice(5);
-          const n = r.types[t] ?? 0;
-          const g = r.guessed[t] ?? 0;
-          return el('span', {}, plain(n), g ? el('span', { class: 'q', title: guessTip(t, n, g) }, '?') : null);
-        }
-        const v = (r as unknown as Record<string, unknown>)[c.key];
-        return plain(typeof v === 'number' ? v : 0);
-      }
+      case PRODUCT: return plainCount((r.types.feature ?? 0) + (r.types.fix ?? 0));
+      default: return rankOther(c.key, r);
     }
   }
 
@@ -749,12 +863,16 @@ export function start(api: Api): () => void {
     if (!rows.length) body.append(el('tr', {}, el('td', { colspan: cols.length, class: 'empty' }, 'Nobody has anything in this ranking in this window.')));
     const notes: Node[] = [];
     const co = Object.entries(v.co_unlinked?.[state.peopleWindow] ?? {});
-    if (co.length) notes.push(el('p', { class: 'muted small' }, `Co-authors without a known account: ${co.map(([n, c]) => `${n} (${c})`).join(', ')}.`));
+    if (co.length) {
+      const names = co.map(([n, c]) => `${n} (${c})`).join(', ');
+      notes.push(el('p', { class: 'muted small' }, `Co-authors without a known account: ${names}.`));
+    }
     if (v.unlinked?.length) notes.push(el('p', { class: 'muted small', id: 'rank-unlinked' }, `Not linked to a GitHub account: ${v.unlinked.join(', ')}.`));
     $('people-main').replaceChildren(el('table', { class: 'people-table', id: 'rank-table' }, el('thead', {}, head), body), ...notes);
   }
 
-  function renderPeople(snap: Snapshot): void {
+  /** Fills the People tab's window and repo pickers; returns the configured repos. */
+  function peoplePickers(snap: Snapshot): string[] {
     const win = $<HTMLSelectElement>('people-window');
     if (!win.options.length) win.append(...WINDOWS.map((w) => el('option', { value: w.id }, w.label)));
     if (win.value !== state.peopleWindow) win.value = state.peopleWindow;
@@ -768,15 +886,18 @@ export function start(api: Api): () => void {
       state.peopleRepo = repos.find((r) => r.toLowerCase() === state.peopleRepo.toLowerCase()) ?? '';
     }
     if (sel.value !== state.peopleRepo) sel.value = state.peopleRepo;
-    const mode = peopleModeOf(state.peopleMode, state.people);
+    return repos;
+  }
+
+  /** Sets the People tab's sub-view buttons, shows the pickers `mode` uses and hides the others, and sets the hint. */
+  function peopleModeControls(mode: PeopleMode): void {
     const ranking = mode === 'rankings';
-    const tracking = mode === 'track';
     document.querySelectorAll<HTMLElement>('#people-view .seg').forEach((b) => {
       b.setAttribute('aria-selected', String(b.dataset.pmode === mode));
       // The Track record button shows only while the config turns it on.
       if (b.dataset.pmode === 'track') b.hidden = !state.people?.track;
     });
-    win.hidden = tracking;
+    $('people-window').hidden = mode === 'track';
     const rankSel = $<HTMLSelectElement>('people-rank');
     if (!rankSel.options.length) rankSel.append(...RANK_MODES.map((m) => el('option', { value: m.id }, m.label)));
     if (rankSel.value !== state.rankMode) rankSel.value = state.rankMode;
@@ -788,16 +909,18 @@ export function start(api: Api): () => void {
     }
     const typeKey = rankSortFor(state.rankSort, 'type').key;
     if (typeSel.value !== typeKey) typeSel.value = typeKey;
-    sel.hidden = ranking;
+    $('people-repo').hidden = ranking;
     rankSel.hidden = !ranking;
     typeSel.hidden = !ranking || state.rankMode !== 'type';
     const hint = $('people-hint');
-    hint.textContent = tracking
-      ? TRACK_HINT
-      : ranking
-        ? '? marks a type set by a fallback rule, * an unverified count. Hover a header for what it counts.'
-        : 'Dotted states were read from comment text, not from GitHub fields; ? marks low confidence. Hover a state for its rule and sentence.';
+    hint.textContent = peopleHint(mode);
     hint.title = hint.textContent;
+  }
+
+  function renderPeople(snap: Snapshot): void {
+    const repos = peoplePickers(snap);
+    const mode = peopleModeOf(state.peopleMode, state.people);
+    peopleModeControls(mode);
     const v = state.people;
     const cached = $('people-cached');
     cached.textContent = cachedText(v);
@@ -807,11 +930,20 @@ export function start(api: Api): () => void {
       $('people-main').replaceChildren(el('p', { class: 'empty' }, NO_RECORDS));
       return;
     }
-    if (ranking || (tracking && v.track)) {
-      if (tracking && v.track) renderTrack(v.track); else renderRankings(v);
-      if (focused) [...document.querySelectorAll<HTMLElement>('#people-main [data-focus]')].find((n) => n.dataset.focus === focused)?.focus();
-      return;
+    if (mode === 'track' && v.track) {
+      renderTrack(v.track);
+      refocus('#people-main', focused);
+    } else if (mode === 'rankings') {
+      renderRankings(v);
+      refocus('#people-main', focused);
+    } else {
+      renderPeopleTable(v, repos);
+      refocus('#people-table', focused);
     }
+  }
+
+  /** The People tab's work table: one row per person in the window and repo, sortable, with a caret that opens their repos and detail. */
+  function renderPeopleTable(v: PeopleView, repos: readonly string[]): void {
     const now = Date.now();
     const rows = peopleRows(v, state.peopleWindow, state.peopleRepo, state.peopleSort);
     const head = el('tr', { class: 'cols' }, PEOPLE_COLUMNS.map((c) => {
@@ -835,7 +967,6 @@ export function start(api: Api): () => void {
     }
     if (!rows.length) body.append(el('tr', {}, el('td', { colspan: PEOPLE_COLUMNS.length, class: 'empty' }, 'Nobody has open work or activity here in this window.')));
     $('people-main').replaceChildren(el('table', { class: 'people-table', id: 'people-table' }, el('thead', {}, head), body));
-    if (focused) [...document.querySelectorAll<HTMLElement>('#people-table [data-focus]')].find((n) => n.dataset.focus === focused)?.focus();
   }
 
   /** The People tab's record age: "Pull requests as of 10:05 (3h ago)", in
@@ -848,7 +979,8 @@ export function start(api: Api): () => void {
     const parts: string[] = [];
     if (age.oldest !== null) {
       const a = ago(new Date(age.oldest).toISOString());
-      parts.push(`Pull requests as of ${clock(age.oldest)} (${a === 'now' ? 'now' : `${a} ago`})`);
+      const since = a === 'now' ? 'now' : `${a} ago`;
+      parts.push(`Pull requests as of ${clock(age.oldest)} (${since})`);
     }
     if (age.unchecked.length) parts.push(`not checked yet: ${age.unchecked.map(shortName).join(', ')}`);
     node.textContent = parts.join(' · ');
@@ -895,6 +1027,30 @@ export function start(api: Api): () => void {
     return mineRows(state.people, repos, login, state.mineSort, Date.now(), needsOnly);
   }
 
+  /** A My PRs row's blocker: its chip, which opens the matched comment when there is one, and a conflict note. */
+  function mineBlocker(r: MineRow): HTMLElement {
+    const i = r.item;
+    const url = i.work.evidence?.url;
+    return el('span', {},
+      el('span', {
+        class: classes('wstate', 'blocker', `tone-${r.blocker.tone}`, i.work.guess && 'guess', r.blocker.tone === 'unread' && 'unread'),
+        title: stateTip(i.work),
+        dataset: url ? { url } : {},
+        onclick: url ? (e: Event) => openUrl(url, e) : null,
+      }, r.blocker.label, i.work.low ? el('span', { class: 'q', 'aria-label': 'low confidence' }, '?') : null),
+      i.work.flags.includes('conflict')
+        ? el('span', { class: 'muted small flag-note', title: 'Conflicts with main; maintainers of this repo rebase contributors’ branches themselves.' }, 'conflict')
+        : null);
+  }
+
+  /** A My PRs row's Reply needed chip, which opens the request; an empty cell when nothing waits for your reply. */
+  function mineReply(r: MineRow, now: number): HTMLElement {
+    const reply = r.reply;
+    if (!reply) return el('span', { class: 'zero' }, '');
+    const url = reply.url || r.item.url;
+    return el('span', { class: 'wstate tone-me', title: replyTip(reply, now), dataset: { url }, onclick: (e: Event) => openUrl(url, e) }, 'Reply needed');
+  }
+
   function mineCell(key: string, r: MineRow, login: string, now: number): Node {
     const i = r.item;
     switch (key) {
@@ -904,22 +1060,8 @@ export function start(api: Api): () => void {
       }
       case 'number': return link(`#${i.number}`, i.url);
       case 'title': return el('span', { class: 'mine-title', title: i.title }, i.title);
-      case 'blocker': {
-        const url = i.work.evidence?.url;
-        return el('span', {},
-          el('span', {
-            class: classes('wstate', 'blocker', `tone-${r.blocker.tone}`, i.work.guess && 'guess', r.blocker.tone === 'unread' && 'unread'),
-            title: stateTip(i.work),
-            dataset: url ? { url } : {},
-            onclick: url ? (e: Event) => openUrl(url, e) : null,
-          }, r.blocker.label, i.work.low ? el('span', { class: 'q', 'aria-label': 'low confidence' }, '?') : null),
-          i.work.flags.includes('conflict')
-            ? el('span', { class: 'muted small flag-note', title: 'Conflicts with main; maintainers of this repo rebase contributors’ branches themselves.' }, 'conflict')
-            : null);
-      }
-      case 'reply': return r.reply
-        ? el('span', { class: 'wstate tone-me', title: replyTip(r.reply, now), dataset: { url: r.reply.url || i.url }, onclick: (e: Event) => openUrl(r.reply!.url || i.url, e) }, 'Reply needed')
-        : el('span', { class: 'zero' }, '');
+      case 'blocker': return mineBlocker(r);
+      case 'reply': return mineReply(r, now);
       case 'held': return r.held ? el('span', { class: 'wstate tone-them', title: heldTip(i, now) }, 'Held') : el('span', { class: 'zero' }, '');
       case 'waits': return el('span', {}, waitsText(i, login));
       case 'in_state': return el('span', { title: i.work.since ? localTime(i.work.since) : 'Time in state unknown' }, durationText(mineValue(r, 'in_state', login, now) as number | null));
@@ -933,9 +1075,8 @@ export function start(api: Api): () => void {
     $<HTMLInputElement>('mine-needs').checked = state.mineNeedsOnly;
     const v = state.people;
     const login = myLogin(v);
-    $('mine-who').textContent = login
-      ? `Open pull requests by ${login} in the ${repos.length} configured repos${v?.my_login ? '' : ' (the token’s user; set people.my_login in the config to list another login)'}`
-      : '';
+    const whose = v?.my_login ? '' : ' (the token’s user; set people.my_login in the config to list another login)';
+    $('mine-who').textContent = login ? `Open pull requests by ${login} in the ${repos.length} configured repos${whose}` : '';
     const main = $('mine-main');
     if (!v) {
       main.replaceChildren(el('p', { class: 'empty' }, NO_RECORDS));
@@ -1002,7 +1143,8 @@ export function start(api: Api): () => void {
     const b = trackBar(r);
     if (!b || r.low === null || r.high === null) return null;
     const pos = (x: number) => `${(Math.min(1, x) * 100).toFixed(1)}%`;
-    const tip = `${pctText(r.faults / Math.max(1, r.counted))}, 90% interval ${pctText(r.low)} to ${pctText(r.high)}${r.baseline ? `; baseline ${pctText(r.baseline.rate)}` : ''}. The bar runs from 0 to ${pctText(b.scale)}.`;
+    const base = r.baseline ? `; baseline ${pctText(r.baseline.rate)}` : '';
+    const tip = `${pctText(r.faults / Math.max(1, r.counted))}, 90% interval ${pctText(r.low)} to ${pctText(r.high)}${base}. The bar runs from 0 to ${pctText(b.scale)}.`;
     return el('span', { class: 'rate-bar', title: tip, 'aria-label': tip },
       el('span', { class: 'rate-band', style: `left: ${pos(b.low)}; width: ${pos(Math.max(0, b.high - b.low))}` }),
       b.base === null ? null : el('span', { class: 'rate-base', style: `left: ${pos(b.base)}` }));
@@ -1019,7 +1161,11 @@ export function start(api: Api): () => void {
           class: 'caret', 'aria-expanded': String(open),
           'aria-label': `${open ? 'Hide' : 'Show'} ${r.login}’s track record in ${shortName(r.repo)}`,
           dataset: { focus: `track-caret:${openKey}` },
-          onclick: () => { if (state.trackOpen.has(openKey)) state.trackOpen.delete(openKey); else state.trackOpen.add(openKey); redrawPeople(); },
+          onclick: () => {
+            if (state.trackOpen.has(openKey)) state.trackOpen.delete(openKey);
+            else state.trackOpen.add(openKey);
+            redrawPeople();
+          },
         }, open ? '▾' : '▸'),
         link(r.login, `https://github.com/${r.login}`, 'who'),
         r.name ? el('span', { class: 'name', title: r.name }, r.name) : null,
@@ -1040,11 +1186,13 @@ export function start(api: Api): () => void {
 
   /** One event in a Track record caret: what it is, the pull request, its date, the rule, the other pull request and its tags. */
   function trackEventLine(e: TrackEvent): HTMLElement {
+    const other = e.other;
+    const by = other?.author ? el('span', { class: 'muted' }, ` by ${other.author}`) : null;
     return el('div', { class: classes('track-event', e.fault && 'fault'), title: eventText(e) },
       el('span', { class: 'kind' }, eventLabel(e.kind)), ' ',
       link(`#${e.number}`, e.url), ' ', e.title, ' ',
       el('span', { class: 'muted' }, e.at ? e.at.slice(0, 10) : 'undated'), ' · ', e.rule,
-      e.other ? el('span', {}, ' · ', link(`#${e.other.number}`, e.other.url), e.other.author ? el('span', { class: 'muted' }, ` by ${e.other.author}`) : null) : null,
+      other ? el('span', {}, ' · ', link(`#${other.number}`, other.url), by) : null,
       e.involves_you ? el('span', { class: 'track-tag' }, 'involves you') : null,
       e.ci_did_not_run ? el('span', { class: 'track-tag' }, 'CI did not run') : null);
   }
@@ -1055,9 +1203,14 @@ export function start(api: Api): () => void {
     const faults = r.events.filter((e) => e.fault);
     const listed = r.events.filter((e) => !e.fault);
     const b = r.baseline;
+    let baseline: HTMLElement | null = null;
+    if (b) {
+      const pool = b.scope === 'repo' ? 'the other authors in this repo' : 'authors across the repos, since this repo has fewer than 5 other authors with a long enough record';
+      baseline = p(`The baseline, ${pctText(b.rate)}, pools ${num(b.faults)} faults in ${num(b.counted)} counted pull requests by ${b.authors.join(', ')} (${pool}).`);
+    }
     return el('div', { class: 'track-detail' },
       p(r.rule),
-      b ? p(`The baseline, ${pctText(b.rate)}, pools ${num(b.faults)} faults in ${num(b.counted)} counted pull requests by ${b.authors.join(', ')} (${b.scope === 'repo' ? 'the other authors in this repo' : 'authors across the repos, since this repo has fewer than 5 other authors with a long enough record'}).`) : null,
+      baseline,
       p(`${num(r.prs)} pull requests opened in the last ${t.window_days} days: ${num(r.mature)} at least 7 days old, ${num(r.decided)} of them decided; ${num(r.counted)} counted; ${num(r.waiting)} waiting for review; ${num(r.pending)} merged in the last 72 hours.`),
       r.ci_ran >= 3 ? p(`Checks ran on ${num(r.ci_ran)} decided pull requests; on ${num(r.ci_own)} a check failed that passed on main when it ran.`) : null,
       el('h4', {}, `Confirmed faults (${faults.length})`),
@@ -1111,6 +1264,36 @@ export function start(api: Api): () => void {
     [...document.querySelectorAll<HTMLElement>('#tbody .caret')].find((b) => b.dataset.focus === `repo-caret:${repo}`)?.focus();
   }
 
+  /** Adds the caret to the name cell of a Repos row when it has none, and sets it for `open`. */
+  function repoCaret(tr: HTMLTableRowElement, repo: string, open: boolean): void {
+    const name = tr.querySelector<HTMLElement>('.repo');
+    if (!name) return;
+    let caret = name.querySelector<HTMLButtonElement>(':scope > .caret');
+    if (!caret) {
+      caret = el('button', {
+        class: 'caret',
+        dataset: { focus: `repo-caret:${repo}` },
+        onclick: (e: Event) => { e.stopPropagation(); toggleRepo(repo); },
+      });
+      name.prepend(caret);
+    }
+    caret.textContent = open ? '▾' : '▸';
+    caret.setAttribute('aria-expanded', String(open));
+    caret.setAttribute('aria-label', `${open ? 'Hide' : 'Show'} the people and open work of ${shortName(repo)}`);
+  }
+
+  /** Puts the detail row of an open repo under its row, drawing it when it is new or `redraw` is set. */
+  function placeRepoDetail(tr: HTMLTableRowElement, repo: string, redraw: boolean): void {
+    let detail = repoDetailRows.get(repo);
+    const fresh = !detail;
+    if (!detail) {
+      detail = el('tr', { class: 'repo-detail', dataset: { detail: repo } }, el('td', { colspan: COLUMNS.length }));
+      repoDetailRows.set(repo, detail);
+    }
+    if (fresh || redraw) detail.cells[0]!.replaceChildren(repoDetail(repo));
+    if (tr.nextElementSibling !== detail) tr.after(detail);
+  }
+
   /** Adds the carets to the rows renderTable drew and puts the open detail rows under them; `focused` is the `data-focus` key that had the focus before. */
   function renderRepoCarets(focused?: string): void {
     const tbody = $('tbody');
@@ -1125,30 +1308,8 @@ export function start(api: Api): () => void {
     for (const tr of rows) {
       const repo = tr.dataset.repo!;
       const open = state.repoOpen.has(repo);
-      const name = tr.querySelector<HTMLElement>('.repo');
-      let caret = name?.querySelector<HTMLButtonElement>(':scope > .caret');
-      if (name && !caret) {
-        caret = el('button', {
-          class: 'caret',
-          dataset: { focus: `repo-caret:${repo}` },
-          onclick: (e: Event) => { e.stopPropagation(); toggleRepo(repo); },
-        });
-        name.prepend(caret);
-      }
-      if (caret) {
-        caret.textContent = open ? '▾' : '▸';
-        caret.setAttribute('aria-expanded', String(open));
-        caret.setAttribute('aria-label', `${open ? 'Hide' : 'Show'} the people and open work of ${shortName(repo)}`);
-      }
-      if (!open) continue;
-      let detail = repoDetailRows.get(repo);
-      const fresh = !detail;
-      if (!detail) {
-        detail = el('tr', { class: 'repo-detail', dataset: { detail: repo } }, el('td', { colspan: COLUMNS.length }));
-        repoDetailRows.set(repo, detail);
-      }
-      if (fresh || redraw) detail.cells[0]!.replaceChildren(repoDetail(repo));
-      if (tr.nextElementSibling !== detail) tr.after(detail);
+      repoCaret(tr, repo, open);
+      if (open) placeRepoDetail(tr, repo, redraw);
     }
     const active = (document.activeElement as HTMLElement | null)?.dataset?.focus;
     if (focused?.startsWith('repo-caret:') && active !== focused) {
@@ -1163,58 +1324,53 @@ export function start(api: Api): () => void {
     const now = Date.now();
     const f = repoFigures(v, repo, state.window, now);
     const windowLabel = windowById(state.window).label.toLowerCase();
-    const section = (title: string, ...kids: (Node | string | null | false)[]) => el('div', {}, el('h4', {}, title), ...kids);
-    const p = (text: string) => el('p', { class: 'small' }, text);
-    const parts = (rec: Record<string, number>, label: (k: string) => string = (k) => k.replaceAll('_', ' ')) =>
-      Object.entries(rec).map(([k, n]) => `${label(k)} ${num(n)}`).join(', ');
+    const p = smallLine;
+    const line = repoItemLine;
+    const conflicting = f.holdsConflicting ? `, ${num(f.holdsConflicting)} of them also conflict` : '';
+    const competing = f.competing.map(([a, b]) => `#${a} and #${b}`).join(', ');
+    return el('div', { class: 'person-detail repo-figures' },
+      el('div', { class: 'wide' }, el('h4', {}, `People, ${windowLabel}`), repoPeopleTable(repo)),
+      detailSection(`Open pull requests: ${num(f.open)}`, ...smallLines(f.byRole.map(roleLine), 'No open pull requests.')),
+      detailSection('Waiting on a maintainer',
+        f.oldestOnMaintainer ? el('div', {}, el('div', { class: 'muted small' }, 'Oldest'), line(f.oldestOnMaintainer, ago(f.oldestOnMaintainer.work.since ?? f.oldestOnMaintainer.created_at, now))) : p('Nothing waits on a maintainer.'),
+        p(f.firstQueue ? `${num(f.firstQueue)} await a first response, median ${durationText(f.firstQueueMedianSecs)}.` : 'Nothing awaits a first response.')),
+      detailSection('Owner decisions',
+        p(`${num(f.holds.length)} held for the owner${conflicting}.`),
+        ...f.holds.map((i) => line(i, [`held ${ago(i.work.hold!.since, now)}`, i.work.hold!.by && `by ${i.work.hold!.by}`, i.work.hold!.category].filter(Boolean).join(', '))),
+        f.parked.length ? el('div', {}, el('div', { class: 'muted small' }, 'Holds the authors placed themselves'), f.parked.map((i) => line(i))) : null),
+      detailSection('Maintainer queues', p(`Workflow approvals ${num(f.approvals)} (one click each), authors who answered ${num(f.answered)}, community approved ${num(f.communityApproved)}, ready to merge ${num(f.ready)}.`)),
+      detailSection('Author queues',
+        p(Object.keys(f.requests).length ? `Maintainer requests: ${repoParts(f.requests)}.` : 'No maintainer requests wait on an author.'),
+        p(`Community requests ${num(f.communityRequests)}, conflicts the author owes ${num(f.conflicts)}, CI failing from the pull request ${num(f.ciFromPr)}, authors who stepped back ${num(f.steppedBack)}.`)),
+      detailSection('main',
+        p(mainChecksLine(f.main)),
+        p(`${num(f.inherited)} open pull requests fail because of main.`)),
+      detailSection(`Flow, ${windowLabel}`, ...smallLines(f.flow ? repoFlowLines(f.flow) : [], 'Nothing merged or closed in this window.')),
+      detailSection('Staleness', ...smallLines(f.staleness.map((s) => `${roleHeading(s.role)}: ${num(s.aging)} aging, ${num(s.stale)} stale.`), 'Nothing is aging or stale.')),
+      detailSection('Dependencies and collisions',
+        ...(f.blocked.length ? f.blocked.map((i) => line(i, `waits for ${prRefs(i.work.blocked_by)}`)) : [p('No pull request waits for another.')]),
+        f.competing.length ? p(`Competing: ${competing}.`) : null));
+  }
+
+  /** The people table of a repo's detail: one row per person in the Repos table's window, or a line while it loads or when it is empty. */
+  function repoPeopleTable(repo: string): HTMLElement {
     const rp = repoDetailOf(repo, state.window);
+    if (rp === undefined) return smallLine('Loading its people…');
+    if (!rp?.people.length) return smallLine('Nobody merged, landed, reviewed or committed here in this window.');
     const peopleCols: RankColumn[] = [
       ...RANK_COLUMNS.merged.filter((c) => ['person', 'merged', 'landed', 'lines', 'commits'].includes(c.key)),
       ...RANK_COLUMNS.maintainer.filter((c) => ['merges', 'reviews', 'review_commits'].includes(c.key)),
       RANK_COLUMNS.type.find((c) => c.key === PRODUCT)!,
     ];
-    const peopleTable = rp === undefined
-      ? p('Loading its people…')
-      : !rp || !rp.people.length
-        ? p('Nobody merged, landed, reviewed or committed here in this window.')
-        : el('table', { class: 'figures' },
-          el('thead', {}, el('tr', {}, peopleCols.map((c) => el('th', { title: c.title }, c.label)))),
-          el('tbody', {}, rp.people.map((row) => el('tr', {}, peopleCols.map((c) => el('td', {}, rankCell(c, row, row.windows[rp.window]!, false, '')))))));
-    const line = (i: Item, extra = '') => el('div', {}, link(`#${i.number}`, i.url), ' ', i.title, ' ',
+    return el('table', { class: 'figures' },
+      el('thead', {}, el('tr', {}, peopleCols.map((c) => el('th', { title: c.title }, c.label)))),
+      el('tbody', {}, rp.people.map((row) => el('tr', {}, peopleCols.map((c) => el('td', {}, rankCell(c, row, row.windows[rp.window]!, false, '')))))));
+  }
+
+  /** An item in a repo's detail: its link, title, author and `extra`, and its state. */
+  function repoItemLine(i: Item, extra = ''): HTMLElement {
+    return el('div', {}, link(`#${i.number}`, i.url), ' ', i.title, ' ',
       el('span', { class: 'muted' }, [i.author, extra].filter(Boolean).join(', ')), ' ', stateChip(i.work));
-    const fl = f.flow;
-    const main = f.main;
-    return el('div', { class: 'person-detail repo-figures' },
-      el('div', { class: 'wide' }, el('h4', {}, `People, ${windowLabel}`), peopleTable),
-      section(`Open pull requests: ${num(f.open)}`, ...(f.byRole.length
-        ? f.byRole.map((g) => p(`${roleHeading(g.role)}: ${num(g.count)} (${Math.round(g.share * 100)}%). ${g.states.map((s) => `${stateLabel(s.state)} ${s.count}`).join(', ')}.`))
-        : [p('No open pull requests.')])),
-      section('Waiting on a maintainer',
-        f.oldestOnMaintainer ? el('div', {}, el('div', { class: 'muted small' }, 'Oldest'), line(f.oldestOnMaintainer, ago(f.oldestOnMaintainer.work.since ?? f.oldestOnMaintainer.created_at, now))) : p('Nothing waits on a maintainer.'),
-        p(f.firstQueue ? `${num(f.firstQueue)} await a first response, median ${durationText(f.firstQueueMedianSecs)}.` : 'Nothing awaits a first response.')),
-      section('Owner decisions',
-        p(`${num(f.holds.length)} held for the owner${f.holdsConflicting ? `, ${num(f.holdsConflicting)} of them also conflict` : ''}.`),
-        ...f.holds.map((i) => line(i, [`held ${ago(i.work.hold!.since, now)}`, i.work.hold!.by && `by ${i.work.hold!.by}`, i.work.hold!.category].filter(Boolean).join(', '))),
-        f.parked.length ? el('div', {}, el('div', { class: 'muted small' }, 'Holds the authors placed themselves'), f.parked.map((i) => line(i))) : null),
-      section('Maintainer queues', p(`Workflow approvals ${num(f.approvals)} (one click each), authors who answered ${num(f.answered)}, community approved ${num(f.communityApproved)}, ready to merge ${num(f.ready)}.`)),
-      section('Author queues',
-        p(Object.keys(f.requests).length ? `Maintainer requests: ${parts(f.requests)}.` : 'No maintainer requests wait on an author.'),
-        p(`Community requests ${num(f.communityRequests)}, conflicts the author owes ${num(f.conflicts)}, CI failing from the pull request ${num(f.ciFromPr)}, authors who stepped back ${num(f.steppedBack)}.`)),
-      section('main',
-        p(main ? `Checks on main: ${main.rollup ? main.rollup.toLowerCase() : 'none reported'}${main.failing.length ? `, failing ${main.failing.join(', ')}` : ''}.` : 'The checks on main have not been read yet.'),
-        p(`${num(f.inherited)} open pull requests fail because of main.`)),
-      section(`Flow, ${windowLabel}`, ...(fl ? [
-        p(`Merged ${num(fl.merged)}${fl.merged ? ` (${parts(fl.merged_by)})` : ''}, landed elsewhere ${num(fl.landed_elsewhere)}.`),
-        Object.keys(fl.closed).length ? p(`Closed without merging: ${parts(fl.closed, stateLabel)}.`) : null,
-        p(`Median ${durationText(fl.median_merge_secs) || 'unknown'} to merge, ${durationText(fl.median_response_secs) || 'unknown'} to the first maintainer response.`),
-        fl.merged ? p(`Merge method: ${parts(fl.methods, (k) => k)}. Mergers: ${parts(fl.mergers, (k) => k)}.`) : null,
-      ] : [p('Nothing merged or closed in this window.')])),
-      section('Staleness', ...(f.staleness.length
-        ? f.staleness.map((s) => p(`${roleHeading(s.role)}: ${num(s.aging)} aging, ${num(s.stale)} stale.`))
-        : [p('Nothing is aging or stale.')])),
-      section('Dependencies and collisions',
-        ...(f.blocked.length ? f.blocked.map((i) => line(i, `waits for ${i.work.blocked_by.map((n) => `#${n}`).join(', ')}`)) : [p('No pull request waits for another.')]),
-        f.competing.length ? p(`Competing: ${f.competing.map(([a, b]) => `#${a} and #${b}`).join(', ')}.`) : null));
   }
 
   function renderStatus(snap: Snapshot): void {

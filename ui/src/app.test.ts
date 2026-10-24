@@ -1044,4 +1044,7 @@ test('a Track record caret lists every fault and listed event with links, and ke
   h.emit('craft:people', trackView());
   assert.equal((h.doc.activeElement as HTMLElement).dataset.focus, 'track-caret:o/beta|ux-one');
   assert.ok(h.doc.querySelector('#track-table tr.detail[data-key="ux-one"]'), 'still open after a new view');
+  caretOf().click();
+  assert.equal(h.doc.querySelector('#track-table tr.detail[data-key="ux-one"]'), null, 'a second click closes the caret');
+  assert.equal(caretOf().getAttribute('aria-expanded'), 'false');
 });
