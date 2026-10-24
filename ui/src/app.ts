@@ -1,13 +1,14 @@
 // Craft Status UI: renders the snapshot pushed by the Rust poller. main.ts
 // picks the Tauri API, or a browser stand-in, and calls `start`.
 
-import { PARITY_FIGURES, figurePct, formatPct, parityTip, parityUrl } from './model.ts';
-import type { ParityField } from './model.ts';
 import {
+  PARITY_FIGURES, figurePct, formatPct, parityTip, parityUrl,
   COLUMNS, RECENT, WINDOWS, MANUAL, windowById, value, orderedEntries, nextSort, dropIndex,
   freshness, ago, totals, urgentAcross, tokenStatus, isRefreshing,
 } from './model.ts';
-import type { Column, Meta, RepoEntry, Snapshot, Sort } from './model.ts';
+import type {
+  Column, Meta, RepoEntry, Snapshot, Sort, ParityField,
+} from './model.ts';
 
 /** What the UI needs from the host: Tauri commands and events, window chrome. */
 export interface Api {
@@ -106,7 +107,8 @@ export function start(api: Api): () => void {
     if (!p) return el('span', { class: 'muted', title }, text);
     const f = p[field];
     const url = parityUrl(entry.repo, p, f);
-    const shown = url ? link(text, url, f.state === 'ok' ? '' : 'muted') : el('span', { class: 'muted' }, text);
+    const cls = f.state === 'ok' ? '' : 'muted';
+    const shown = url ? link(text, url, cls) : el('span', { class: 'muted' }, text);
     return el('span', { class: 'parity', title }, f.state === 'unreadable' && el('span', { class: 'warn-dot', 'aria-hidden': 'true' }), shown);
   }
 

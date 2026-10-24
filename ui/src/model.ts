@@ -499,8 +499,9 @@ export function parityUrl(repo: string, p: Parity, f: Figure): string | null {
   const at = encodeURIComponent(p.commit ?? 'HEAD');
   if (p.parity_doc) return `https://github.com/${repo}/blob/${at}/docs/target-app-parity.md`;
   if (!p.roadmap_oid) return null;
-  const path = (f.state === 'absent' ? 'ROADMAP.md' : f.path).split('/').map(encodeURIComponent).join('/');
-  return `https://github.com/${repo}/blob/${at}/${path}${f.state === 'absent' ? '' : `?plain=1#L${f.line}`}`;
+  if (f.state === 'absent') return `https://github.com/${repo}/blob/${at}/ROADMAP.md`;
+  const path = f.path.split('/').map(encodeURIComponent).join('/');
+  return `https://github.com/${repo}/blob/${at}/${path}?plain=1#L${f.line}`;
 }
 
 /** The tooltip of a parity cell: the row and its basis, or why there is no number, and the review date. */
@@ -509,8 +510,7 @@ export function parityTip(p: Parity | null | undefined, field: ParityField): str
   const f = p[field];
   const lines: string[] = [];
   if (f.state === 'ok') {
-    lines.push(`${f.label}: ${f.text}`);
-    lines.push(f.kind ? `${BASIS_TEXT[f.basis]} · ${f.kind}` : BASIS_TEXT[f.basis]);
+    lines.push(`${f.label}: ${f.text}`, f.kind ? `${BASIS_TEXT[f.basis]} · ${f.kind}` : BASIS_TEXT[f.basis]);
     if (f.from) lines.push(`Source: ${f.from}`);
   } else {
     lines.push(f.why);
