@@ -8,8 +8,6 @@ import {
   stateBreakdown, stateLabel, stateTip, countText, fromTextTip, durationText, waitsOn, heldCount, cachedText, recordsAge,
   RANK_MODES, RANK_COLUMNS, TYPES, PRODUCT, rankRows, nextRankSort, rankSortFor, linesText, guessTip, batchText,
   BATCH_TIP, UNVERIFIED_TIP, DIRECT_MISSING_TIP, RELEASE_TIP, TIME_NOTE, workLead, repoFigures, prRefs,
-} from './model.ts';
-import {
   searchWords, matchesSearch, personSearchFields, personMatches, matchText, peopleGroups, groupTotals, GROUP_TOTALS_TIP,
   rankRowsOf, rankTotal, RANK_TOTALS_TIP,
 } from './model.ts';
@@ -855,13 +853,15 @@ export function start(api: Api): () => void {
   /** A repo section's header row: a caret that collapses it, the repo, how many people it lists, and `cells` for the other columns. */
   function sectionRow(repo: string, count: number | null, closed: boolean, cells: string[], title: string): HTMLTableRowElement {
     const entry = state.snap?.repos.find((e) => e.repo === repo);
+    const noun = count === 1 ? 'person' : 'people';
+    const counted = count === null ? 'loading…' : `${num(count)} ${noun}`;
     const first = el('td', {},
       el('button', {
         class: 'caret', 'aria-expanded': String(!closed), 'aria-label': `${closed ? 'Show' : 'Hide'} the people of ${shortName(repo)}`,
         dataset: { focus: `group:${repo}` }, onclick: () => toggleGroup(repo),
       }, closed ? '▸' : '▾'),
       el('span', { class: 'group-name' }, appIcon(entry ?? { repo }), shortName(repo)),
-      el('span', { class: 'group-count' }, count === null ? 'loading…' : `${num(count)} ${count === 1 ? 'person' : 'people'}`));
+      el('span', { class: 'group-count' }, counted));
     return el('tr', { class: 'repo-group', dataset: { group: repo }, title }, first, ...cells.map((c) => el('td', {}, c)));
   }
 
@@ -893,47 +893,10 @@ export function start(api: Api): () => void {
       body.append(el('tr', { class: 'rank-row', dataset: { key: row.key, group } }, cols.map((c) => el('td', {}, rankCell(c, row, rank, open, 'rank-caret', openKey)))));
       if (open) body.append(el('tr', { class: 'detail', dataset: { key: row.key, group } }, el('td', { colspan: cols.length }, personTables(row.key, group))));
     };
-    const shown = new Set<string>();
-    const listed = new Set<string>();
-    let pending = false;
-    if (state.peopleGroup) {
-      for (const repo of repos) {
-        const rp = repoDetailOf(repo, state.peopleWindow);
-        if (rp === undefined) {
-          pending = true;
-          body.append(sectionRow(repo, null, state.groupClosed.has(repo), cols.slice(1).map(() => ''), 'Loading this repo’s people'));
-          continue;
-        }
-        const all = rp ? rankRowsOf(rp.people, rp.window, mode, sort) : [];
-        for (const { row } of all) listed.add(row.key);
-        const rows = all.filter(({ row }) => matchesSearch(words, personSearchFields(v, row, [repo])));
-        if (!rows.length) continue;
-        for (const { row } of rows) shown.add(row.key);
-        const closed = state.groupClosed.has(repo);
-        body.append(sectionRow(repo, rows.length, closed, cols.slice(1).map((c) => rankTotal(rows, c.key)), RANK_TOTALS_TIP));
-        if (!closed) for (const r of rows) addRow(r, repo);
-      }
-    } else {
-      const all = rankRows(v, state.peopleWindow, mode, sort);
-      for (const { row } of all) listed.add(row.key);
-      // A repo matches the people its section lists when grouped: the ones
-      // with figures for this ranking in its `repo_detail`, which is read the
-      // first time a person's names leave a word unmatched.
-      let members: Map<string, Set<string>> | null = null;
-      const rankRepos = (key: string): string[] => {
-        members ??= new Map(repos.map((repo) => {
-          const rp = repoDetailOf(repo, state.peopleWindow);
-          if (rp === undefined) pending = true;
-          return [repo, new Set(rp ? rankRowsOf(rp.people, rp.window, mode, sort).map(({ row }) => row.key) : [])];
-        }));
-        return repos.filter((repo) => members!.get(repo)!.has(key));
-      };
-      const rows = all.filter(({ row }) => personMatches(v, row, words, () => rankRepos(row.key)));
-      for (const r of rows) { shown.add(r.row.key); addRow(r, ''); }
-    }
-    if (!body.childElementCount) {
-      body.append(noneRow(cols.length, words.length ? (pending ? 'Looking up each repo’s people…' : noMatch()) : 'Nobody has anything in this ranking in this window.'));
-    }
+    const draw: RankDraw = { v, repos, words, mode, sort, body, addRow, shown: new Set(), listed: new Set(), pending: false };
+    if (state.peopleGroup) groupedRankRows(draw);
+    else flatRankRows(draw);
+    if (!body.childElementCount) body.append(noneRow(cols.length, rankEmptyText(words, draw.pending)));
     const notes: Node[] = [];
     const co = Object.entries(v.co_unlinked?.[state.peopleWindow] ?? {});
     if (co.length) {
@@ -942,7 +905,73 @@ export function start(api: Api): () => void {
     }
     if (v.unlinked?.length) notes.push(el('p', { class: 'muted small', id: 'rank-unlinked' }, `Not linked to a GitHub account: ${v.unlinked.join(', ')}.`));
     $('people-main').replaceChildren(el('table', { class: 'people-table', id: 'rank-table' }, el('thead', {}, head), body), ...notes);
-    return [shown.size, listed.size, pending];
+    return [draw.shown.size, draw.listed.size, draw.pending];
+  }
+
+  /** What drawing the Rankings rows reads, and what it counts: who it shows and lists, and whether a repo's people are still being asked for. */
+  interface RankDraw {
+    v: PeopleView;
+    repos: readonly string[];
+    words: readonly string[];
+    mode: RankMode;
+    sort: Sort;
+    body: HTMLElement;
+    addRow: (r: { row: RankRow; rank: Rank }, group: string) => void;
+    shown: Set<string>;
+    listed: Set<string>;
+    pending: boolean;
+  }
+
+  /** The grouped Rankings rows: one section per repo with each person's figures in that repo. */
+  function groupedRankRows(d: RankDraw): void {
+    const cols = RANK_COLUMNS[d.mode];
+    for (const repo of d.repos) {
+      const rp = repoDetailOf(repo, state.peopleWindow);
+      if (rp === undefined) {
+        d.pending = true;
+        d.body.append(sectionRow(repo, null, state.groupClosed.has(repo), cols.slice(1).map(() => ''), 'Loading this repo’s people'));
+      } else {
+        rankSection(d, repo, rp ? rankRowsOf(rp.people, rp.window, d.mode, d.sort) : []);
+      }
+    }
+  }
+
+  /** One repo's section of the grouped Rankings: its header with the totals and, while it is open, the rows of the people in `all` that the search matches. */
+  function rankSection(d: RankDraw, repo: string, all: readonly { row: RankRow; rank: Rank }[]): void {
+    for (const { row } of all) d.listed.add(row.key);
+    const rows = all.filter(({ row }) => matchesSearch(d.words, personSearchFields(d.v, row, [repo])));
+    if (!rows.length) return;
+    for (const { row } of rows) d.shown.add(row.key);
+    const closed = state.groupClosed.has(repo);
+    const cols = RANK_COLUMNS[d.mode];
+    d.body.append(sectionRow(repo, rows.length, closed, cols.slice(1).map((c) => rankTotal(rows, c.key)), RANK_TOTALS_TIP));
+    if (!closed) for (const r of rows) d.addRow(r, repo);
+  }
+
+  /** The Rankings rows without groups. */
+  function flatRankRows(d: RankDraw): void {
+    const all = rankRows(d.v, state.peopleWindow, d.mode, d.sort);
+    for (const { row } of all) d.listed.add(row.key);
+    // A repo matches the people its section lists when grouped: the ones
+    // with figures for this ranking in its `repo_detail`, which is read the
+    // first time a person's names leave a word unmatched.
+    let members: Map<string, Set<string>> | null = null;
+    const rankRepos = (key: string): string[] => {
+      members ??= new Map(d.repos.map((repo) => {
+        const rp = repoDetailOf(repo, state.peopleWindow);
+        if (rp === undefined) d.pending = true;
+        return [repo, new Set(rp ? rankRowsOf(rp.people, rp.window, d.mode, d.sort).map(({ row }) => row.key) : [])];
+      }));
+      return d.repos.filter((repo) => members!.get(repo)!.has(key));
+    };
+    const rows = all.filter(({ row }) => personMatches(d.v, row, d.words, () => rankRepos(row.key)));
+    for (const r of rows) { d.shown.add(r.row.key); d.addRow(r, ''); }
+  }
+
+  /** The line under an empty Rankings table. */
+  function rankEmptyText(words: readonly string[], pending: boolean): string {
+    if (!words.length) return 'Nobody has anything in this ranking in this window.';
+    return pending ? 'Looking up each repo’s people…' : noMatch();
   }
 
   /** Fills the People tab's window and repo pickers; returns the configured repos. */

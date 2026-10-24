@@ -991,8 +991,11 @@ export function personMatches(view: PeopleView, who: SearchedPerson, words: read
 }
 
 /** "3 of 12 people" for a search; '' without one. */
-export const matchText = (shown: number, total: number, words: readonly string[]): string =>
-  (words.length ? `${formatCount(shown)} of ${formatCount(total)} ${total === 1 ? 'person' : 'people'}` : '');
+export const matchText = (shown: number, total: number, words: readonly string[]): string => {
+  if (!words.length) return '';
+  const noun = total === 1 ? 'person' : 'people';
+  return `${formatCount(shown)} of ${formatCount(total)} ${noun}`;
+};
 
 /** One repo's people in the grouped Work view. */
 export interface PeopleGroup { repo: string; rows: PersonFigures[] }

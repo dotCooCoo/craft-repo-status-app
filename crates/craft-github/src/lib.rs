@@ -308,6 +308,27 @@ impl GitHub {
         answer
     }
 
+    /// The JSON body of a REST GET of `url`, or `None` for a 204 answer. A
+    /// background client sends it at its gate, and a rate limit on it stops
+    /// the client's later requests, as for [`GitHub::graphql_body`].
+    fn get_json(&self, url: &str) -> Result<Option<Value>> {
+        let permit = self.permit()?;
+        let answer = self
+            .http
+            .get(url)
+            .headers(self.headers())
+            .send()
+            .map_err(Error::from)
+            .and_then(Self::check)
+            .and_then(|resp| match resp.status().as_u16() {
+                204 => Ok(None),
+                _ => Ok(Some(resp.json::<Value>()?)),
+            })
+            .map_err(|e| self.note_limit(e));
+        drop(permit);
+        answer
+    }
+
     /// The `data` of a query about one `repository`, which must be there.
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let mut v = self.graphql_body(query, variables)?;
@@ -376,12 +397,9 @@ impl GitHub {
 
     /// The app icon blob `oid` (from [`RepoStats::icon_oid`]) as a `data:` URI.
     pub fn icon(&self, repo: &str, oid: &str) -> Result<String> {
-        let resp = self
-            .http
-            .get(format!("{}/repos/{repo}/git/blobs/{oid}", self.api))
-            .headers(self.headers())
-            .send()?;
-        let v: Value = Self::check(resp)?.json()?;
+        let v = self
+            .get_json(&format!("{}/repos/{repo}/git/blobs/{oid}", self.api))?
+            .unwrap_or_default();
         let b64: String = v["content"]
             .as_str()
             .unwrap_or_default()
@@ -512,20 +530,14 @@ impl GitHub {
         let mut out = Vec::new();
         // 20 pages × 100 people; the cap guards against loops.
         for page in 1..=20 {
-            let resp = self
-                .http
-                .get(format!(
-                    "{}/repos/{repo}/contributors?per_page=100&anon=1&page={page}",
-                    self.api
-                ))
-                .headers(self.headers())
-                .send()?;
-            let resp = Self::check(resp)?;
+            let url = format!(
+                "{}/repos/{repo}/contributors?per_page=100&anon=1&page={page}",
+                self.api
+            );
             // 204: empty repository.
-            if resp.status().as_u16() == 204 {
+            let Some(body) = self.get_json(&url)? else {
                 break;
-            }
-            let body: Value = resp.json()?;
+            };
             let people = parse_contributors(&body);
             let done = people.len() < 100;
             out.extend(people);
@@ -1511,6 +1523,39 @@ mod tests {
             Err(Error::RateLimited(_))
         ));
         assert_eq!(gate.halted(), None);
+    }
+
+    #[test]
+    fn rest_requests_of_a_background_client_wait_at_its_gate() {
+        let limited = r#"{"message": "API rate limit exceeded"}"#;
+        let primary = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nx-ratelimit-remaining: 0\r\n\
+             x-ratelimit-reset: 2000000000\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{limited}",
+            limited.len()
+        );
+        let (api, requests) = stub(vec![primary.clone(), primary]);
+        let gate = Arc::new(Gate::new());
+        let background = GitHub::with_api("t", api)
+            .unwrap()
+            .in_background(gate.clone());
+        assert!(matches!(
+            background.icon("o/r", "b1"),
+            Err(Error::RateLimited(_))
+        ));
+        assert!(gate.halted().is_some(), "the rate limit stops the others");
+        assert!(matches!(
+            background.icon("o/r", "b1"),
+            Err(Error::Halted(_))
+        ));
+        assert!(matches!(
+            background.contributors("o/r"),
+            Err(Error::Halted(_))
+        ));
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            requests.recv_timeout(Duration::from_millis(200)).is_err(),
+            "no request after the rate limit"
+        );
     }
 
     #[test]

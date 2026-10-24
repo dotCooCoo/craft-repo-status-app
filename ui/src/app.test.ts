@@ -879,6 +879,7 @@ test('the People search filters Work and Rankings as you type, counts the matche
   keydown(h, '4', true);
   const search = peopleSearch(h);
   const matches = h.doc.getElementById('people-matches')!;
+  assert.equal(matches.tagName.toLowerCase(), 'output', 'the count is announced as a status');
   assert.equal(matches.textContent, '', 'no search, no count');
   keydown(h, 'f', true);
   assert.ok(h.doc.activeElement === search, '⌘F focuses the search');
