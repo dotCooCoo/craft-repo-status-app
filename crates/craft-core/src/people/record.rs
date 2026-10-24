@@ -59,6 +59,8 @@ pub struct PrRecord {
     /// The branch the pull request merges into; its commit and file lists
     /// hold what the head has that this branch does not.
     pub base_ref_name: String,
+    /// The commit that branch pointed to at the last deep fetch.
+    pub base_ref_oid: String,
     pub is_cross_repository: bool,
     pub maintainer_can_modify: bool,
     pub body: String,
@@ -399,13 +401,14 @@ impl PrRecord {
         checks.contexts_cursor = new.checks.contexts_cursor.take();
         checks.suites = std::mem::take(&mut new.checks.suites);
         // File pages fetched after the first stay while the head they were
-        // read at and the base are the same.
+        // read at, the base branch and its commit are the same.
         let same_base = self.base_ref_name == new.base_ref_name;
         let (old, fresh) = (&self.contribution, &new.contribution);
         if old.files.len() > fresh.files.len()
             && old.files_total == fresh.files_total
             && old.files_head == new.head_ref_oid
             && same_base
+            && self.base_ref_oid == new.base_ref_oid
         {
             new.contribution.files = std::mem::take(&mut self.contribution.files);
             new.contribution.files_cursor = self.contribution.files_cursor.take();
