@@ -134,7 +134,7 @@ fn record(
             }
             searched(found, one)
         }
-        Err(e @ (GhError::GraphQl(_) | GhError::NotFound)) => {
+        Err(e @ (GhError::GraphQl(_) | GhError::NotFound | GhError::Http(422, _))) => {
             eprintln!("open pull request search for {owner}: {e}");
             failed(found)
         }
@@ -533,7 +533,8 @@ mod tests {
         };
         let now = Utc::now();
         let refused = GhError::GraphQl("the listed users cannot be searched".into());
-        for error in [refused, GhError::NotFound] {
+        let invalid = GhError::Http(422, "Validation Failed".into());
+        for error in [refused, GhError::NotFound, invalid] {
             let acme = next_owner(&mut found, &cfg, now).unwrap();
             record(&state, &mut found, &acme, Err(error), None, now);
             assert!(found.round.is_some(), "the round goes on");
