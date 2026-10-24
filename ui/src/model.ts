@@ -496,8 +496,9 @@ const BASIS_TEXT: Readonly<Record<Basis, string>> = {
  * has no ROADMAP.md; null when it has neither file.
  */
 function reviewLine(p: Parity, f: Figure): string | null {
-  const src = f.state !== 'absent' ? f.path : p.roadmap_oid ? 'ROADMAP.md' : p.parity_doc ? 'docs/target-app-parity.md' : null;
-  if (!src) return null;
+  let src = 'ROADMAP.md';
+  if (f.state !== 'absent') src = f.path;
+  else if (!p.roadmap_oid && p.parity_doc) src = 'docs/target-app-parity.md';
   if (src !== 'ROADMAP.md') {
     const reviewed = p.files.find((x) => x.path === src)?.reviewed;
     return reviewed ? `${src} last reviewed ${reviewed}` : `${src} has no Last reviewed date`;
