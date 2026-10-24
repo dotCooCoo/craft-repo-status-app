@@ -7,8 +7,8 @@ import {
   NOT_READ_YET, PEOPLE_COLUMNS, ROLE_LABELS, roleHeading, peopleRows, personFigures, personRepos, nextPeopleSort, repoItems,
   stateBreakdown, stateLabel, stateTip, countText, fromTextTip, durationText, waitsOn, heldCount, cachedText, recordsAge,
   RANK_MODES, RANK_COLUMNS, TYPES, PRODUCT, rankRows, nextRankSort, rankSortFor, linesText, guessTip, batchText,
-  BATCH_TIP, UNVERIFIED_TIP, DIRECT_MISSING_TIP, RELEASE_TIP, TIME_NOTE, workLead, repoFigures,
-  MINE_COLUMNS, heldTip, mineRows, mineValue, myLogin, nextMineSort, replyTip, waitsText, prRefs,
+  BATCH_TIP, UNVERIFIED_TIP, DIRECT_MISSING_TIP, RELEASE_TIP, TIME_NOTE, workLead, repoFigures, prRefs,
+  MINE_COLUMNS, heldTip, mineRows, mineValue, myLogin, nextMineSort, replyTip, waitsText,
   TRACK_COLUMNS, TRACK_HINT, eventLabel, eventText, levelLabel, levelTip, pctText, peopleModeIn, peopleModeOf, trackBar, trackRows,
 } from './model.ts';
 import type {
@@ -143,6 +143,8 @@ const noneLine = (text: string): HTMLElement => el('p', { class: 'muted small' }
 const smallLine = (text: string): HTMLElement => el('p', { class: 'small' }, text);
 /** `lines` as small paragraphs, or `none` as a muted line when there are none. */
 const smallLines = (lines: readonly string[], none: string): HTMLElement[] => (lines.length ? lines.map(smallLine) : [noneLine(none)]);
+/** `lines` as small paragraphs, or `none` as one when there are none. */
+const smallLinesOr = (lines: readonly string[], none: string): HTMLElement[] => (lines.length ? lines : [none]).map(smallLine);
 
 /** A repo's open pull requests that wait on one role: the count, its share and the count in each state. */
 function roleLine(g: RepoFigures['byRole'][number]): string {
@@ -1330,7 +1332,7 @@ export function start(api: Api): () => void {
     const competing = f.competing.map(([a, b]) => `#${a} and #${b}`).join(', ');
     return el('div', { class: 'person-detail repo-figures' },
       el('div', { class: 'wide' }, el('h4', {}, `People, ${windowLabel}`), repoPeopleTable(repo)),
-      detailSection(`Open pull requests: ${num(f.open)}`, ...smallLines(f.byRole.map(roleLine), 'No open pull requests.')),
+      detailSection(`Open pull requests: ${num(f.open)}`, ...smallLinesOr(f.byRole.map(roleLine), 'No open pull requests.')),
       detailSection('Waiting on a maintainer',
         f.oldestOnMaintainer ? el('div', {}, el('div', { class: 'muted small' }, 'Oldest'), line(f.oldestOnMaintainer, ago(f.oldestOnMaintainer.work.since ?? f.oldestOnMaintainer.created_at, now))) : p('Nothing waits on a maintainer.'),
         p(f.firstQueue ? `${num(f.firstQueue)} await a first response, median ${durationText(f.firstQueueMedianSecs)}.` : 'Nothing awaits a first response.')),
@@ -1345,8 +1347,8 @@ export function start(api: Api): () => void {
       detailSection('main',
         p(mainChecksLine(f.main)),
         p(`${num(f.inherited)} open pull requests fail because of main.`)),
-      detailSection(`Flow, ${windowLabel}`, ...smallLines(f.flow ? repoFlowLines(f.flow) : [], 'Nothing merged or closed in this window.')),
-      detailSection('Staleness', ...smallLines(f.staleness.map((s) => `${roleHeading(s.role)}: ${num(s.aging)} aging, ${num(s.stale)} stale.`), 'Nothing is aging or stale.')),
+      detailSection(`Flow, ${windowLabel}`, ...smallLinesOr(f.flow ? repoFlowLines(f.flow) : [], 'Nothing merged or closed in this window.')),
+      detailSection('Staleness', ...smallLinesOr(f.staleness.map((s) => `${roleHeading(s.role)}: ${num(s.aging)} aging, ${num(s.stale)} stale.`), 'Nothing is aging or stale.')),
       detailSection('Dependencies and collisions',
         ...(f.blocked.length ? f.blocked.map((i) => line(i, `waits for ${prRefs(i.work.blocked_by)}`)) : [p('No pull request waits for another.')]),
         f.competing.length ? p(`Competing: ${competing}.`) : null));

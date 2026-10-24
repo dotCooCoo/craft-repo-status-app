@@ -414,8 +414,14 @@ impl<'a> Pass<'a> {
     /// into `cache`. A pull request read for the first time (not held, or
     /// held only as a sweep's record that was never fetched) with fewer
     /// than [`TL_NEW`] items whose timeline filled them all is marked for
-    /// the backfill, which reads more. Returns how many there were and the
-    /// newest and oldest `updatedAt` among them.
+    /// the backfill, which reads more. So is a fetched one whose items,
+    /// only the newest of its timeline, include none of the items it kept:
+    /// the items between them were missed, so the kept ones go and the
+    /// backfill reads the newest [`TL_NEW`]. A record marked for the
+    /// backfill stays marked through such reads while it holds fewer than
+    /// the newest [`TL_NEW`] items.
+    /// Returns how many there were and the newest and oldest `updatedAt`
+    /// among them.
     fn take(
         &self,
         cache: &mut PrCache,
@@ -435,13 +441,24 @@ impl<'a> Pass<'a> {
             };
             let number = rec.number;
             let full = tl < TL_NEW && rec.timeline.len() as u64 >= tl;
-            let new = cache
-                .records
-                .get(&number)
-                .is_none_or(|r| r.fetched_at.is_none());
+            let held = cache.records.get_mut(&number);
+            let new = held.as_ref().is_none_or(|r| r.fetched_at.is_none());
+            let was_stale = held.as_ref().is_some_and(|r| r.stale);
+            let gap = match held {
+                Some(r) if !new && misses_kept_items(r, &rec) => {
+                    r.timeline.clear();
+                    true
+                }
+                _ => false,
+            };
             cache.put(rec, self.now);
-            if let (true, Some(r)) = (new && full, cache.records.get_mut(&number)) {
-                r.stale = true;
+            if let Some(r) = cache.records.get_mut(&number) {
+                // A record still waiting for the backfill stays marked while
+                // it holds fewer than the newest items the backfill reads.
+                let short = (r.timeline.len() as u64) < r.timeline_total.min(TL_NEW);
+                if full && (new || gap || (was_stale && short)) {
+                    r.stale = true;
+                }
             }
             n += 1;
         }
@@ -1197,6 +1214,25 @@ fn next_cursor(conn: &Value) -> Option<String> {
     conn["pageInfo"]["endCursor"].as_str().map(str::to_string)
 }
 
+/// Whether `fresh` read only the newest items of its timeline, fewer than
+/// were added since `kept` was read, and none of them is an item `kept`
+/// holds: the items between them were not read.
+fn misses_kept_items(kept: &PrRecord, fresh: &PrRecord) -> bool {
+    let kept_ids: BTreeSet<&str> = kept
+        .timeline
+        .iter()
+        .map(|t| t.id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let read = fresh.timeline.len() as u64;
+    read + kept.timeline_total < fresh.timeline_total
+        && !kept_ids.is_empty()
+        && !fresh
+            .timeline
+            .iter()
+            .any(|t| kept_ids.contains(t.id.as_str()))
+}
+
 fn parse_files(conn: &Value) -> Vec<FileLines> {
     conn["nodes"]
         .as_array()
@@ -1359,6 +1395,7 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
         merged_by,
         head_ref_name: string(&v["headRefName"]),
         head_ref_oid: string(&v["headRefOid"]),
+        base_ref_name: string(&v["baseRefName"]),
         is_cross_repository: v["isCrossRepository"].as_bool().unwrap_or(false),
         maintainer_can_modify: v["maintainerCanModify"].as_bool().unwrap_or(false),
         body: string(&v["body"]),
@@ -1392,6 +1429,7 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
             files: parse_files(&v["files"]),
             files_total: count(&v["files"]),
             files_cursor: next_cursor(&v["files"]),
+            files_head: string(&v["headRefOid"]),
             commits,
             commits_total: count(&v["commits"]),
             commits_cursor: next_cursor(&v["commits"]),
@@ -1606,7 +1644,7 @@ pub const PR_FRAGMENT: &str = r#"
 fragment R on PullRequest {
   id number url title state isDraft createdAt updatedAt closedAt mergedAt
   author { __typename login } authorAssociation mergedBy { login }
-  maintainerCanModify isCrossRepository headRefName headRefOid
+  maintainerCanModify isCrossRepository headRefName headRefOid baseRefName
   mergeable mergeStateStatus body additions deletions changedFiles
   mergeCommit { oid messageHeadline parents(first: 2) { totalCount } committer { name user { login } } }
   assignees(first: 3) { nodes { login } }
@@ -2071,6 +2109,86 @@ mod tests {
         assert!(!cache.records[&4].needs_fetch());
     }
 
+    #[test]
+    fn a_changed_list_page_that_misses_the_kept_items_is_read_again() {
+        let now = t("2026-10-17T12:00:00Z");
+        let mut cache = PrCache {
+            high_water: Some(t("2026-10-17T10:00:00Z")),
+            ..Default::default()
+        };
+        let start = t("2026-10-16T00:00:00Z");
+        let items = |number: u64, from: usize, to: usize| -> Vec<Value> {
+            (from..to)
+                .map(|i| {
+                    let at = (start + chrono::Duration::minutes(i as i64)).to_rfc3339();
+                    json!({"__typename": "IssueComment", "id": format!("c{number}-{i}"), "createdAt": at,
+                           "author": {"__typename": "User", "login": "ann"}, "authorAssociation": "NONE", "body": "hi"})
+                })
+                .collect()
+        };
+        let read = |number: u64, total: usize, updated: &str| {
+            let mut n = node(number, "OPEN", updated);
+            n["timelineItems"] = json!({"totalCount": total, "nodes": items(number, total.saturating_sub(50), total)});
+            parse_pr(&n).unwrap()
+        };
+        // #4 and #6 were read with their first 10 items.
+        cache.put(read(4, 10, "2026-10-17T09:00:00Z"), now);
+        cache.put(read(6, 10, "2026-10-17T09:00:00Z"), now);
+        // Since then #4 got 70 more items and #6 got 50; the changed list
+        // reads the newest 50 of each.
+        let (api, _requests) = stub(vec![page(
+            vec![
+                {
+                    let mut n = node(4, "OPEN", "2026-10-17T11:30:00Z");
+                    n["timelineItems"] = json!({"totalCount": 80, "nodes": items(4, 30, 80)});
+                    n
+                },
+                {
+                    let mut n = node(6, "OPEN", "2026-10-17T11:20:00Z");
+                    n["timelineItems"] = json!({"totalCount": 60, "nodes": items(6, 10, 60)});
+                    n
+                },
+            ],
+            None,
+            4000,
+        )]);
+        let gh = GitHub::with_api("t", api).unwrap();
+        pass(&gh, now)
+            .changed("o/r", &mut cache, Some(&seen_at("2026-10-17T11:30:00Z")))
+            .unwrap();
+        let four = &cache.records[&4];
+        assert!(four.needs_fetch(), "items 10 to 29 were missed");
+        assert_eq!(
+            four.timeline.first().map(|i| i.id.as_str()),
+            Some("c4-30"),
+            "the items before the gap go"
+        );
+        let six = &cache.records[&6];
+        assert!(
+            !six.needs_fetch(),
+            "the page starts right after the kept items"
+        );
+        assert_eq!(six.timeline.len(), 60);
+        // Before the backfill reads #4, the changed list reads its newest 50
+        // again, which now overlap the items it holds: it stays marked.
+        let (api, _requests) = stub(vec![page(
+            vec![{
+                let mut n = node(4, "OPEN", "2026-10-17T11:40:00Z");
+                n["timelineItems"] = json!({"totalCount": 85, "nodes": items(4, 35, 85)});
+                n
+            }],
+            None,
+            4000,
+        )]);
+        let gh = GitHub::with_api("t", api).unwrap();
+        pass(&gh, now)
+            .changed("o/r", &mut cache, Some(&seen_at("2026-10-17T11:40:00Z")))
+            .unwrap();
+        let four = &cache.records[&4];
+        assert_eq!(four.timeline.len(), 55);
+        assert!(four.needs_fetch(), "still waiting for the backfill");
+    }
+
     fn sweep_page(open: Vec<Value>) -> String {
         ok_json(
             &json!({"data": {
@@ -2522,6 +2640,92 @@ mod tests {
             (c.commits.len(), c.commits_cursor.as_deref()),
             (100, Some("k100"))
         );
+    }
+
+    #[test]
+    fn pages_read_against_another_base_or_another_first_page_are_not_kept() {
+        let now = t("2026-10-17T12:00:00Z");
+        let fetch = |base: &str, total: usize| {
+            let mut n = node(9, "OPEN", "2026-10-17T11:30:00Z");
+            n["headRefOid"] = json!(format!("k{}", total - 1));
+            n["baseRefName"] = json!(base);
+            n["commits"] = commits(total, 0, 100);
+            parse_pr(&n).unwrap()
+        };
+        let read_on = |cache: &mut PrCache| {
+            let rec = cache.records.get_mut(&9).unwrap();
+            let page = parse_commits(&commits(250, 100, 100), 0);
+            rec.contribution.commits.extend(page);
+            rec.contribution.commits_cursor = Some("k200".into());
+        };
+        let pages = |cache: &PrCache| {
+            let c = &cache.records[&9].contribution;
+            (c.commits.len(), c.commits_cursor.clone())
+        };
+        let first_page = (100, Some("k100".to_string()));
+        // Pages read part way, then the base branch changes.
+        let mut cache = PrCache::default();
+        cache.put(fetch("main", 250), now);
+        read_on(&mut cache);
+        cache.put(fetch("main", 250), now);
+        assert_eq!(pages(&cache), (200, Some("k200".into())), "the same base");
+        cache.put(fetch("dev", 250), now);
+        assert_eq!(pages(&cache), first_page, "a new base");
+        // A whole list that ends at the head, then a base change.
+        let mut whole = PrCache::default();
+        whole.put(fetch("main", 150), now);
+        let rec = whole.records.get_mut(&9).unwrap();
+        rec.contribution
+            .commits
+            .extend(parse_commits(&commits(150, 100, 100), 0));
+        rec.contribution.commits_cursor = None;
+        whole.put(fetch("main", 150), now);
+        assert_eq!(pages(&whole), (150, None), "the same base");
+        whole.put(fetch("dev", 150), now);
+        assert_eq!(pages(&whole), first_page, "a new base");
+        // The same base and head, but a first page that starts differently.
+        let mut whole2 = whole.clone();
+        let rec = whole2.records.get_mut(&9).unwrap();
+        rec.contribution
+            .commits
+            .extend(parse_commits(&commits(150, 100, 100), 0));
+        rec.contribution.commits_cursor = None;
+        let mut moved = fetch("dev", 150);
+        moved.contribution.commits[0].oid = "j0".into();
+        whole2.put(moved, now);
+        let c = &whole2.records[&9].contribution;
+        assert_eq!(
+            (c.commits.len(), c.commits[0].oid.as_str()),
+            (100, "j0"),
+            "the new first page"
+        );
+        // File pages read against one base are not kept for another.
+        let with_files = |base: &str| {
+            let mut r = fetch(base, 250);
+            r.contribution.files_total = 2;
+            r.contribution.files = vec![FileLines {
+                path: "a".into(),
+                ..Default::default()
+            }];
+            r
+        };
+        let mut files = PrCache::default();
+        files.put(with_files("main"), now);
+        let second = FileLines {
+            path: "b".into(),
+            ..Default::default()
+        };
+        files
+            .records
+            .get_mut(&9)
+            .unwrap()
+            .contribution
+            .files
+            .push(second);
+        files.put(with_files("main"), now);
+        assert_eq!(files.records[&9].contribution.files.len(), 2);
+        files.put(with_files("dev"), now);
+        assert_eq!(files.records[&9].contribution.files.len(), 1);
     }
 
     /// A sweep answer with 130 checks on main, of which `flaky` (the 111th)
