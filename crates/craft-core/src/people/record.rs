@@ -100,7 +100,19 @@ pub struct Checks {
     pub rollup: Option<String>,
     /// The names of the head commit's failing checks.
     pub failing: Vec<String>,
+    /// Where the rest of the head commit's checks start, while `failing`
+    /// holds only the pages read so far.
+    pub contexts_cursor: Option<ContextsCursor>,
     pub suites: Vec<Suite>,
+}
+
+/// Where the rest of a commit's checks start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ContextsCursor {
+    /// The commit's node id.
+    pub commit: String,
+    pub after: String,
 }
 
 /// One check suite on the head commit.
@@ -189,9 +201,11 @@ pub struct Contribution {
     /// Where the rest of the file list starts.
     pub files_cursor: Option<String>,
     pub commits: Vec<PrCommit>,
-    /// GitHub's count of commits; more than `commits` holds when the pull
-    /// request has over 100.
+    /// GitHub's count of commits; more than `commits` holds until the rest
+    /// of the list is fetched.
     pub commits_total: u64,
+    /// Where the rest of the commit list starts.
+    pub commits_cursor: Option<String>,
     pub merge_commit: Option<MergeCommit>,
     /// Who landed it: see [`super::merger`].
     pub merger: Option<String>,
@@ -325,6 +339,7 @@ impl PrRecord {
         let failed = matches!(light.rollup.as_deref(), Some("FAILURE" | "ERROR"));
         if new_head {
             self.checks.failing.clear();
+            self.checks.contexts_cursor = None;
         }
         // A check suite that failed, recovered or ran again changes the
         // failing names, though the rollup may stay failed.
@@ -372,6 +387,7 @@ impl PrRecord {
         checks.set_mergeable(&new.checks.mergeable, &new.checks.merge_state, now);
         checks.rollup = new.checks.rollup.take();
         checks.failing = std::mem::take(&mut new.checks.failing);
+        checks.contexts_cursor = new.checks.contexts_cursor.take();
         checks.suites = std::mem::take(&mut new.checks.suites);
         // File pages fetched after the first stay while the head is the same.
         let (old, fresh) = (&self.contribution, &new.contribution);
@@ -381,6 +397,19 @@ impl PrRecord {
         {
             new.contribution.files = std::mem::take(&mut self.contribution.files);
             new.contribution.files_cursor = self.contribution.files_cursor.take();
+        }
+        // So do commit pages, while the kept list ends at the new head.
+        let (old, fresh) = (&self.contribution, &new.contribution);
+        let ends_at_head = old
+            .commits
+            .last()
+            .is_some_and(|k| k.oid == new.head_ref_oid);
+        if old.commits.len() > fresh.commits.len()
+            && old.commits_total == fresh.commits_total
+            && ends_at_head
+        {
+            new.contribution.commits = std::mem::take(&mut self.contribution.commits);
+            new.contribution.commits_cursor = self.contribution.commits_cursor.take();
         }
         let derived = std::mem::take(&mut self.derived);
         let comments_total = self.comments_total;
