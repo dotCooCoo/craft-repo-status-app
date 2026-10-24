@@ -103,9 +103,11 @@ pub fn read(out: &mut Parity, d: Option<&Doc>) {
         let t0 = tables[0];
         let has_beta_col = t0.col(&["beta", "b", "blocks beta"]).is_some();
         let impact_beta = t0.col(&["impact", "user impact"]).is_some_and(|c| {
-            t0.rows
-                .iter()
-                .any(|r| r.cells.get(c).is_some_and(|x| impact_blocks_beta(&x.text)))
+            t0.rows.iter().any(|r| {
+                r.cells
+                    .get(c)
+                    .is_some_and(|x| impact_beta(&x.text) == Some(true))
+            })
         });
         // A prose sentence names the gaps that block beta; it says nothing
         // about the others, which stay unknown.
@@ -341,16 +343,17 @@ fn table_gaps(d: &Doc, t: &Table, ctx: &Ctx, rank_from: u32, group: Option<Strin
         }
         if let Some(c) = t.cell(r, impact_col) {
             let l = c.text.trim().to_lowercase();
-            if impact_blocks_beta(&l) {
+            let says = impact_beta(&l);
+            if says == Some(true) {
                 beta = Some(Flag::Yes);
                 src = Some("impact".into());
             } else if !l.is_empty() {
-                if beta.is_none() && ctx.beta_known {
+                if beta.is_none() && (ctx.beta_known || says == Some(false)) {
                     beta = Some(Flag::No);
                     src = Some("impact".into());
                 }
                 // A rating such as "high"; a sentence describing the impact is not one.
-                if c.text.split_whitespace().count() <= 3 {
+                if says.is_none() && c.text.split_whitespace().count() <= 3 {
                     priority = Some(c.text.trim().to_string());
                 }
             }
@@ -428,16 +431,36 @@ fn table_gaps(d: &Doc, t: &Table, ctx: &Ctx, rank_from: u32, group: Option<Strin
     out
 }
 
-/// Whether an Impact cell says the gap blocks beta: "blocks beta", but not
-/// "no longer blocks beta", "never blocks beta" or "not blocks beta".
-fn impact_blocks_beta(text: &str) -> bool {
+/// What an Impact cell says about beta: `Some(true)` for "blocks beta",
+/// `Some(false)` for "no longer blocks beta", "never blocks beta", "not
+/// blocks beta" or "nothing blocks beta", and `None` when it says neither.
+/// "blocks beta" counts only as whole words, so "unblocks beta" says neither.
+fn impact_beta(text: &str) -> Option<bool> {
+    const PHRASE: &str = "blocks beta";
     let l = text.to_lowercase();
-    l.match_indices("blocks beta").any(|(i, _)| {
-        let before = l[..i].trim_end();
-        !["no longer", "never", "not", "nothing"]
+    let mut negated = false;
+    for (i, _) in l.match_indices(PHRASE) {
+        let before = &l[..i];
+        let after = &l[i + PHRASE.len()..];
+        if before
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+            || after.chars().next().is_some_and(char::is_alphanumeric)
+        {
+            continue;
+        }
+        let before = before.trim_end();
+        if ["no longer", "never", "not", "nothing"]
             .iter()
             .any(|n| before.ends_with(n))
-    })
+        {
+            negated = true;
+        } else {
+            return Some(true);
+        }
+    }
+    negated.then_some(false)
 }
 
 /// A Beta cell's flag, and a note: `B (pane)` is Beta with a scope note,
@@ -1201,11 +1224,18 @@ mod tests {
         );
         let p = gaps("| # | Gap | Beta | Impact |\n|---|---|---|---|\n| G1 | A | no | no longer blocks beta |\n");
         assert_eq!(p.gaps[0].beta, Flag::No, "the Beta column's no stays");
-        let p = gaps("| # | Gap | Impact |\n|---|---|---|\n| G1 | A | no longer blocks beta |\n");
-        assert_ne!(
+        let p = gaps("| # | Gap | Impact |\n|---|---|---|\n| G1 | A | no longer blocks beta |\n| G2 | B | crashes |\n| G3 | C | never blocks beta |\n");
+        assert_eq!(
+            p.gaps.iter().map(|g| g.beta.clone()).collect::<Vec<_>>(),
+            [Flag::No, Flag::Unknown, Flag::No],
+            "a table whose Impact cells only negate it says nothing about the others"
+        );
+        assert_eq!(p.gaps[2].priority, None);
+        let p = gaps("| # | Gap | Impact |\n|---|---|---|\n| G1 | A | unblocks beta |\n");
+        assert_eq!(
             p.gaps[0].beta,
-            Flag::Yes,
-            "a table whose only Impact negates it"
+            Flag::Unknown,
+            "\"unblocks\" is not \"blocks\""
         );
     }
 
