@@ -1341,6 +1341,7 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
         head_ref_name: string(&v["headRefName"]),
         head_ref_oid: string(&v["headRefOid"]),
         base_ref_name: string(&v["baseRefName"]),
+        base_ref_oid: string(&v["baseRefOid"]),
         is_cross_repository: v["isCrossRepository"].as_bool().unwrap_or(false),
         maintainer_can_modify: v["maintainerCanModify"].as_bool().unwrap_or(false),
         body: string(&v["body"]),
@@ -1586,7 +1587,7 @@ pub const PR_FRAGMENT: &str = r#"
 fragment R on PullRequest {
   id number url title state isDraft createdAt updatedAt closedAt mergedAt
   author { __typename login } authorAssociation mergedBy { login }
-  maintainerCanModify isCrossRepository headRefName headRefOid baseRefName
+  maintainerCanModify isCrossRepository headRefName headRefOid baseRefName baseRefOid
   mergeable mergeStateStatus body additions deletions changedFiles
   mergeCommit { oid messageHeadline parents(first: 2) { totalCount } committer { name user { login } } }
   assignees(first: 3) { nodes { login } }
@@ -2571,8 +2572,13 @@ mod tests {
             "the new first page"
         );
         // File pages read against one base are not kept for another.
-        let with_files = |base: &str| {
-            let mut r = fetch(base, 250);
+        let with_files = |base: &str, base_oid: &str| {
+            let mut n = node(9, "OPEN", "2026-10-17T11:30:00Z");
+            n["headRefOid"] = json!("k249");
+            n["baseRefName"] = json!(base);
+            n["baseRefOid"] = json!(base_oid);
+            n["commits"] = commits(250, 0, 100);
+            let mut r = parse_pr(&n).unwrap();
             r.contribution.files_total = 2;
             r.contribution.files = vec![FileLines {
                 path: "a".into(),
@@ -2580,23 +2586,37 @@ mod tests {
             }];
             r
         };
-        let mut files = PrCache::default();
-        files.put(with_files("main"), now);
-        let second = FileLines {
-            path: "b".into(),
-            ..Default::default()
+        let read_second = |files: &mut PrCache| {
+            let second = FileLines {
+                path: "b".into(),
+                ..Default::default()
+            };
+            files
+                .records
+                .get_mut(&9)
+                .unwrap()
+                .contribution
+                .files
+                .push(second);
         };
-        files
-            .records
-            .get_mut(&9)
-            .unwrap()
-            .contribution
-            .files
-            .push(second);
-        files.put(with_files("main"), now);
+        let mut files = PrCache::default();
+        files.put(with_files("main", "b1"), now);
+        read_second(&mut files);
+        files.put(with_files("main", "b1"), now);
         assert_eq!(files.records[&9].contribution.files.len(), 2);
-        files.put(with_files("dev"), now);
-        assert_eq!(files.records[&9].contribution.files.len(), 1);
+        files.put(with_files("main", "b2"), now);
+        assert_eq!(
+            files.records[&9].contribution.files.len(),
+            1,
+            "the base branch moved"
+        );
+        read_second(&mut files);
+        files.put(with_files("dev", "b2"), now);
+        assert_eq!(
+            files.records[&9].contribution.files.len(),
+            1,
+            "another base branch"
+        );
     }
 
     /// A sweep answer with 130 checks on main, of which `flaky` (the 111th)
