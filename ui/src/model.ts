@@ -866,8 +866,11 @@ export const PEOPLE_COLUMNS: readonly PeopleColumn[] = [
   { key: 'reviews', label: 'Reviews given', title: 'Comments and reviews on other people’s pull requests in the window' },
 ];
 
+/** A column's value for sorting; null sorts last. */
+export type SortValue = number | string | null;
+
 /** The value of column `key` in `f`, for sorting; null sorts last. */
-export function personValue(f: PersonFigures, key: string): number | string | null {
+export function personValue(f: PersonFigures, key: string): SortValue {
   switch (key) {
     case 'person': return f.login.toLowerCase();
     case 'open': return f.open;
@@ -1023,7 +1026,7 @@ export const RANK_COLUMNS: Readonly<Record<RankMode, readonly RankColumn[]>> = {
 };
 
 /** The value of ranking column `key` for a person with figures `r`, for sorting; null sorts last. */
-export function rankValue(row: RankRow, r: Rank, key: string): number | string | null {
+export function rankValue(row: RankRow, r: Rank, key: string): SortValue {
   switch (key) {
     case 'person': return row.login.toLowerCase();
     case 'lines': return r.added + r.removed;
@@ -1269,14 +1272,19 @@ const waitsOnLogin = (item: Item, login: string): boolean => item.work.waits_for
 /** `item`'s blocker for `login`: the label of its work state, and whether that state is approved or ready to merge, waits on CI, on them, on someone else, or has not been read yet. */
 export function blockerOf(item: Item, login: string): Blocker {
   const w = item.work;
-  const tone: Tone = w.state === NOT_READ_YET ? 'unread'
-    : READY_STATES.has(w.state) ? 'ready'
-    : w.state === 'ci_running' ? 'ci'
-    : waitsOnLogin(item, login) ? 'me' : 'them';
   const label = w.state === 'depends_on_other_pr' && w.blocked_by.length
-    ? `Depends on ${w.blocked_by.map((n) => `#${n}`).join(', ')}`
+    ? `Depends on ${prRefs(w.blocked_by)}`
     : BLOCKER_LABELS[w.state] ?? stateLabel(w.state);
-  return { state: w.state, label, tone };
+  return { state: w.state, label, tone: toneOf(item, login) };
+}
+
+/** Whether `item` is approved or ready to merge, waits on CI, on `login`, on someone else, or has not been read yet. */
+function toneOf(item: Item, login: string): Tone {
+  const w = item.work;
+  if (w.state === NOT_READ_YET) return 'unread';
+  if (READY_STATES.has(w.state)) return 'ready';
+  if (w.state === 'ci_running') return 'ci';
+  return waitsOnLogin(item, login) ? 'me' : 'them';
 }
 
 /** Whether `item` is held for the owner: its state, a request that also carries a hold, or a hold that an earlier rule outranked. */
@@ -1308,7 +1316,7 @@ export const MINE_COLUMNS: readonly MineColumn[] = [
 ];
 
 /** The value of My PRs column `key` for `row`, for sorting; null sorts last. */
-export function mineValue(row: MineRow, key: string, login: string, now: number): number | string | null {
+export function mineValue(row: MineRow, key: string, login: string, now: number): SortValue {
   const i = row.item;
   switch (key) {
     case 'repo': return (i.repo.split('/').pop() ?? i.repo).toLowerCase();
@@ -1366,7 +1374,7 @@ const agoText = (iso: Time, now: number): string => {
 /** The hover text of a Reply chip: who asked, when and for what. */
 export function replyTip(r: Reply, now: number = Date.now()): string {
   const when = r.at ? agoText(r.at, now) : 'at an unknown time';
-  return `${r.by} asked ${when}${r.subtype ? ` (${r.subtype.replaceAll('_', ' ')})` : ''}, and you have not answered since.\nClick to open the request.`;
+  return `${r.by} asked ${when}${subtypeText(r.subtype)}, and you have not answered since.\nClick to open the request.`;
 }
 
 /** The hover text of a Held chip: for how long, by whom and why, or that an earlier rule decided the state. */

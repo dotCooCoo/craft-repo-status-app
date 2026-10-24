@@ -8,15 +8,14 @@ import {
   stateBreakdown, stateLabel, stateTip, countText, fromTextTip, durationText, waitsOn, heldCount, cachedText, recordsAge,
   RANK_MODES, RANK_COLUMNS, TYPES, PRODUCT, rankRows, nextRankSort, rankSortFor, linesText, guessTip, batchText,
   BATCH_TIP, UNVERIFIED_TIP, DIRECT_MISSING_TIP, RELEASE_TIP, TIME_NOTE, workLead, repoFigures, prRefs,
+  MINE_COLUMNS, heldTip, mineRows, mineValue, myLogin, nextMineSort, replyTip, waitsText,
 } from './model.ts';
 import type {
   Column, Meta, RepoEntry, Snapshot, Sort,
   DetailRow, Flow, Given, Item, MainChecks, PeopleView, PersonDetail, PersonFigures, PersonResponse, PersonRow, Rank, RankColumn, RankMode, RankRow,
   RepoFigures, RepoFlow, RepoPeople,
-  StateTime, WorkState,
+  StateTime, WorkState, MineRow,
 } from './model.ts';
-import { MINE_COLUMNS, heldTip, mineRows, mineValue, myLogin, nextMineSort, replyTip, waitsText } from './model.ts';
-import type { MineRow } from './model.ts';
 
 /** What the UI needs from the host: Tauri commands and events, window chrome. */
 export interface Api {
@@ -1012,6 +1011,30 @@ export function start(api: Api): () => void {
     return mineRows(state.people, repos, login, state.mineSort, Date.now(), needsOnly);
   }
 
+  /** A My PRs row's blocker: its chip, which opens the matched comment when there is one, and a conflict note. */
+  function mineBlocker(r: MineRow): HTMLElement {
+    const i = r.item;
+    const url = i.work.evidence?.url;
+    return el('span', {},
+      el('span', {
+        class: classes('wstate', 'blocker', `tone-${r.blocker.tone}`, i.work.guess && 'guess', r.blocker.tone === 'unread' && 'unread'),
+        title: stateTip(i.work),
+        dataset: url ? { url } : {},
+        onclick: url ? (e: Event) => openUrl(url, e) : null,
+      }, r.blocker.label, i.work.low ? el('span', { class: 'q', 'aria-label': 'low confidence' }, '?') : null),
+      i.work.flags.includes('conflict')
+        ? el('span', { class: 'muted small flag-note', title: 'Conflicts with main; maintainers of this repo rebase contributors’ branches themselves.' }, 'conflict')
+        : null);
+  }
+
+  /** A My PRs row's Reply needed chip, which opens the request; an empty cell when nothing waits for your reply. */
+  function mineReply(r: MineRow, now: number): HTMLElement {
+    const reply = r.reply;
+    if (!reply) return el('span', { class: 'zero' }, '');
+    const url = reply.url || r.item.url;
+    return el('span', { class: 'wstate tone-me', title: replyTip(reply, now), dataset: { url }, onclick: (e: Event) => openUrl(url, e) }, 'Reply needed');
+  }
+
   function mineCell(key: string, r: MineRow, login: string, now: number): Node {
     const i = r.item;
     switch (key) {
@@ -1021,22 +1044,8 @@ export function start(api: Api): () => void {
       }
       case 'number': return link(`#${i.number}`, i.url);
       case 'title': return el('span', { class: 'mine-title', title: i.title }, i.title);
-      case 'blocker': {
-        const url = i.work.evidence?.url;
-        return el('span', {},
-          el('span', {
-            class: classes('wstate', 'blocker', `tone-${r.blocker.tone}`, i.work.guess && 'guess', r.blocker.tone === 'unread' && 'unread'),
-            title: stateTip(i.work),
-            dataset: url ? { url } : {},
-            onclick: url ? (e: Event) => openUrl(url, e) : null,
-          }, r.blocker.label, i.work.low ? el('span', { class: 'q', 'aria-label': 'low confidence' }, '?') : null),
-          i.work.flags.includes('conflict')
-            ? el('span', { class: 'muted small flag-note', title: 'Conflicts with main; maintainers of this repo rebase contributors’ branches themselves.' }, 'conflict')
-            : null);
-      }
-      case 'reply': return r.reply
-        ? el('span', { class: 'wstate tone-me', title: replyTip(r.reply, now), dataset: { url: r.reply.url || i.url }, onclick: (e: Event) => openUrl(r.reply!.url || i.url, e) }, 'Reply needed')
-        : el('span', { class: 'zero' }, '');
+      case 'blocker': return mineBlocker(r);
+      case 'reply': return mineReply(r, now);
       case 'held': return r.held ? el('span', { class: 'wstate tone-them', title: heldTip(i, now) }, 'Held') : el('span', { class: 'zero' }, '');
       case 'waits': return el('span', {}, waitsText(i, login));
       case 'in_state': return el('span', { title: i.work.since ? localTime(i.work.since) : 'Time in state unknown' }, durationText(mineValue(r, 'in_state', login, now) as number | null));
@@ -1050,9 +1059,8 @@ export function start(api: Api): () => void {
     $<HTMLInputElement>('mine-needs').checked = state.mineNeedsOnly;
     const v = state.people;
     const login = myLogin(v);
-    $('mine-who').textContent = login
-      ? `Open pull requests by ${login} in the ${repos.length} configured repos${v?.my_login ? '' : ' (the token’s user; set people.my_login in the config to list another login)'}`
-      : '';
+    const whose = v?.my_login ? '' : ' (the token’s user; set people.my_login in the config to list another login)';
+    $('mine-who').textContent = login ? `Open pull requests by ${login} in the ${repos.length} configured repos${whose}` : '';
     const main = $('mine-main');
     if (!v) {
       main.replaceChildren(el('p', { class: 'empty' }, NO_RECORDS));
