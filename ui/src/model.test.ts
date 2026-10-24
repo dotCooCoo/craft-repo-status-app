@@ -291,6 +291,10 @@ test('a parity tooltip gives the row, its basis and the review date, or why ther
     'Feature breadth: ~88%', 'Estimated · estimated', `${tap} last reviewed 2026-10-12`, `Click to open ${tap} on GitHub`,
   ].join('\n'), 'a figure from the parity document gives that document\'s review date');
   assert.match(parityTip({ ...fromTap, files: [] }, 'ready'), new RegExp(`\n${tap} has no Last reviewed date\n`));
+  const tapAbsent = { ...fromTap, ready: { state: 'absent', why: 'No Ready for real work row' } as const };
+  assert.equal(parityTip(tapAbsent, 'ready'), [
+    'No Ready for real work row', `${tap} last reviewed 2026-10-12`, `Click to open ${tap} on GitHub`,
+  ].join('\n'), 'an absent figure without a ROADMAP.md gives the parity document\'s review date');
 });
 
 test('a parity cell links to the parity document at the commit read, else to its ROADMAP.md row', () => {

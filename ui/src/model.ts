@@ -490,9 +490,14 @@ const BASIS_TEXT: Readonly<Record<Basis, string>> = {
   measured: 'Measured', partly: 'Partly measured', estimated: 'Estimated', unknown: 'Basis not stated',
 };
 
-/** The Last reviewed date of the file figure `f` was read from, for its tooltip; null without a ROADMAP.md to name. */
+/**
+ * The Last reviewed date of the file figure `f` was read from, for its tooltip.
+ * An absent figure names ROADMAP.md, or docs/target-app-parity.md when the repo
+ * has no ROADMAP.md; null when it has neither file.
+ */
 function reviewLine(p: Parity, f: Figure): string | null {
-  const src = f.state === 'absent' ? 'ROADMAP.md' : f.path;
+  const src = f.state !== 'absent' ? f.path : p.roadmap_oid ? 'ROADMAP.md' : p.parity_doc ? 'docs/target-app-parity.md' : null;
+  if (!src) return null;
   if (src !== 'ROADMAP.md') {
     const reviewed = p.files.find((x) => x.path === src)?.reviewed;
     return reviewed ? `${src} last reviewed ${reviewed}` : `${src} has no Last reviewed date`;
