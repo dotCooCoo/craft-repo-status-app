@@ -9,8 +9,8 @@ import type { Activity, RepoEntry, RepoStats, UrgentIssue } from './model.ts';
 import { figurePct, formatPct, parityTip, parityUrl } from './model.ts';
 import type { Figure, Parity } from './model.ts';
 import {
-  allGaps, areaStrip, betaUnknownWhy, blocksLabel, changedAt, checklistSummary, dimsByDrag, docUrl, gapTotal, heatMeans, hoursText, kindSums, nextGapSort,
-  parityBadge, parityNextSort, parityOrder, reviewAgeDays, sourceUrl, whyMissing, NO_GAP_FILTER,
+  allGaps, areaStrip, audienceFigure, betaUnknownWhy, blocksLabel, changedAt, checklistSummary, dimsByDrag, docUrl, gapTotal, heatMeans, hoursText, kindSums,
+  nextGapSort, parityBadge, parityNextSort, parityOrder, partText, reviewAgeDays, sourceUrl, sumText, whyMissing, NO_GAP_FILTER,
 } from './model.ts';
 import type { Area, Checklist, Dim, DocFile, Gap, Heat, Hours } from './model.ts';
 
@@ -366,6 +366,9 @@ test('All gaps orders by blocking band, then rank across apps, and filters', () 
   assert.deepEqual(ids(allGaps(rows, { ...NO_GAP_FILTER, minHours: 30 })), ['B1']);
   assert.deepEqual(ids(allGaps(rows, { ...NO_GAP_FILTER, text: 'color' })), ['B1']);
   assert.deepEqual(ids(allGaps(rows, NO_GAP_FILTER, { key: 'hours', dir: 'desc' })).slice(0, 2), ['B1', 'A1']);
+  assert.deepEqual(ids(allGaps(rows, NO_GAP_FILTER, { key: 'hours', dir: 'desc' })), ['B1', 'A1', 'A2', 'A4', 'B2'], 'gaps without hours last');
+  assert.deepEqual(ids(allGaps(rows, NO_GAP_FILTER, { key: 'hours', dir: 'asc' })), ['A1', 'B1', 'A2', 'A4', 'B2'], 'gaps without hours last');
+  assert.deepEqual(ids(allGaps(rows, NO_GAP_FILTER, { key: 'rank', dir: 'desc' })), ['A2', 'B2', 'A1', 'B1', 'A4'], 'unranked last');
   assert.deepEqual(nextGapSort(null, 'hours'), { key: 'hours', dir: 'desc' });
   assert.deepEqual(nextGapSort({ key: 'hours', dir: 'desc' }, 'hours'), { key: 'hours', dir: 'asc' });
   assert.equal(nextGapSort({ key: 'hours', dir: 'asc' }, 'hours'), null, 'the third click restores the default order');
@@ -392,6 +395,17 @@ test('gap sums leave out closed gaps and add no hours twice for a gap counted in
   assert.equal(hoursText(hours(1200, 1500)), '1,200–1,500 h');
   assert.equal(hoursText(hours(3, 3)), '3 h');
   assert.equal(hoursText(null), '—');
+  assert.equal(sumText({ count: 3, lo: 10, hi: 20, unknown: 1 }), '10–20 h + 1 unestimated');
+  assert.equal(partText({ count: 3, lo: 10, hi: 1200, unknown: 1 }), 'part of 3 gaps (up to 1,200 h, 1 unestimated)');
+  assert.equal(partText({ count: 2, lo: 4, hi: 8, unknown: 0 }), 'part of 2 gaps (up to 8 h)');
+  assert.equal(partText({ count: 2, lo: 0, hi: 0, unknown: 2 }), 'part of 2 gaps (hours unknown)');
+});
+
+test('the audience picker reads the readiness figure of its audience', () => {
+  const p = parity({ ready: figure(50), mainstream: figure(70), essentials: figure(90) });
+  assert.equal(figurePct(audienceFigure(p, 'full')), 50);
+  assert.equal(figurePct(audienceFigure(p, 'mainstream')), 70);
+  assert.equal(figurePct(audienceFigure(p, 'essentials')), 90);
 });
 
 test('a gap flag says what it blocks', () => {

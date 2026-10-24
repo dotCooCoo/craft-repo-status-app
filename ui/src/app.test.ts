@@ -463,6 +463,73 @@ test('the detail pane keeps an expanded section through a snapshot, and explains
   assert.equal(pane.querySelector('p.muted')!.textContent, 'Not accessible (private, or not found).');
 });
 
+test('the Apps cells and the detail pane title each number with where it was read', async () => {
+  type ParityDim = ParityReport['dims'][number];
+  const hrs = (lo: number, hi: number) => ({ lo, hi, approx: false, basis: null, note: null, raw: `${lo}–${hi} h`, counted_in: null });
+  const src = (line: number) => ({ path: 'ROADMAP.md', line });
+  const pct = (value: number) => ({
+    state: 'ok' as const, v: { kind: 'pct' as const, value, approx: false, low: null, high: null, basis: 'estimated' as const, raw: `${value}%`, note: null, computed: false }, src: src(30),
+  });
+  const dim = (name: string, d: Partial<ParityDim> = {}): ParityDim => ({
+    name, group: 'features', weight: 2, weight_src: null, ready: pct(50), breadth: noValue, hours: noValue, kind: '', doc: null,
+    counted: null, child: false, fills: 'ready', only_in: null, src: src(20), shortfall: null, ...d,
+  });
+  const alpha = report({
+    stage: {
+      state: 'ok', v: { name: 'alpha', steps: [{ stage: 'beta', points: 12, hours: hrs(40, 60), text: '' }, { stage: 'full', points: null, hours: null, text: '' }] },
+      src: src(3), from: 'Stage row',
+    },
+    files: [
+      { path: 'ROADMAP.md', oid: 'r1', reviewed: '2026-10-01', updated: '2026-10-02', generated: null, target: null, date_lines: 2, line: 2, why: null, commit_date: null, commit: null },
+      { path: 'docs/gaps.md', oid: 'g1', reviewed: null, updated: null, generated: null, target: null, date_lines: 0, line: null, why: 'No date line', commit_date: null, commit: null },
+    ],
+    dims: [dim('Text', { shortfall: 4, only_in: 'w' }), dim('Vertical text', { child: true })],
+    areas: [{
+      name: 'Text', full_name: 'Text and type', key: 'text', weight: null, weight_src: null, breadth: noValue, ready: pct(40), ready_from: null,
+      hours: { state: 'ok', v: hrs(10, 20), src: src(40) }, missing: [], more: 0, chips_from: 'none', raw_gaps: '', gaps_header: null,
+      unweighted: false, dup_lines: [], conflict: null, kind: '', doc: null, counts: null, src: src(40), shortfall: null,
+    }],
+    area_weights_why: 'No Weight column',
+    checklists: [{
+      kind: 'tiered', path: 'parity/features.toml', overall: 50, more: 2,
+      tiers: [{ name: 'P0', done: 5, ahead: 1, partial: 2, missing: 3, excluded: 0, not_measured: 0, unrecognized: 4, pct: 50 }],
+      rows: [{ status: 'missing', group: 'P0', text: 'Row', notes: '', line: 4 }],
+    }],
+    gaps: [parityGap('G1', { rank: 1 })],
+    gap_totals: {
+      beta: null, partial: { count: 2, lo: 0, hi: 30, unknown: 1 }, alpha: 0, alpha_none: true, stated: { state: 'ok', v: hrs(100, 200), src: src(5) },
+      ids_stable: true, form: 'table', beta_unknown: false,
+    },
+    to_beta: { state: 'ok', v: hrs(300, 400), src: src(6) },
+  });
+  const none = 'No ROADMAP.md or docs/target-app-parity.md at HEAD';
+  const h = await setup({ snap: snapshot([
+    repo('alpha', {}, { parity: alpha }),
+    repo('beta', {}, { parity: report({ na: none }) }),
+    repo('delta', null, { fetched_at: null }),
+    repo('gone', null, { inaccessible: true }),
+  ]), storage: { view: 'parity' } });
+  const appTitle = (name: string) => parityCell(h, name, 'App').querySelector<HTMLElement>('.repo')!.title;
+  assert.deepEqual(['alpha', 'beta', 'delta', 'gone'].map(appTitle), ['Read at c1', none, 'Not read yet', 'Not accessible']);
+  assert.equal(parityCell(h, 'alpha', 'Stage').querySelector<HTMLElement>('.stage')!.title, 'next: beta, 12 points, 40–60 h\nnext: full\nFrom Stage row');
+  const betaGaps = parityCell(h, 'alpha', 'Beta gaps');
+  assert.equal(betaGaps.textContent, '0');
+  assert.equal(betaGaps.querySelector<HTMLElement>('span')!.title, 'Open gaps that block beta\n+ part of 2 gaps (up to 30 h, 1 unestimated)');
+
+  h.doc.querySelector<HTMLElement>('#parity-rows tr[data-repo="o/alpha"]')!.click();
+  const pane = h.doc.getElementById('parity-detail')!;
+  const chips = [...pane.querySelectorAll<HTMLElement>('.fresh-chip')];
+  assert.deepEqual(chips.map((c) => c.textContent), ['ROADMAP.md reviewed 2026-10-01 · updated 2026-10-02', 'gaps.md No date line']);
+  assert.deepEqual(chips.map((c) => c.title), ['ROADMAP.md\n2 date lines\nLast commit not read', 'docs/gaps.md\nLast commit not read']);
+  const dimRows = [...pane.querySelector('table.detail-table')!.querySelectorAll<HTMLTableRowElement>('tbody tr')];
+  assert.deepEqual(dimRows.map((r) => r.cells[0]!.title), ['Text\nOnly in the weight table', 'Vertical text\nPart of the row above; left out of the sums']);
+  assert.ok([...pane.querySelectorAll('h4')].some((x) => x.textContent === 'Areas (sorted by hours: No Weight column)'));
+  assert.equal(pane.querySelector<HTMLElement>('.tier')!.title, '5 done, 1 ahead, 2 partial, 3 missing, 0 out of scope, 4 unrecognized');
+  assert.equal(pane.querySelector('details[data-key="rows/parity/features.toml"] summary')!.textContent, 'Partial and missing rows (1, +2 more)');
+  assert.equal(pane.querySelector('.gap-totals')!.textContent,
+    'No beta gaps + part of 2 gaps (up to 30 h, 1 unestimated); docs/gaps.md says 100–200 h; ROADMAP says 300–400 h to beta');
+});
+
 test('All gaps lists every app’s open gaps by blocking band, filters them, and sorts by a column', async () => {
   const h = await setup({ snap: paritySnapshot(), storage: { view: 'parity' } });
   h.doc.querySelector<HTMLElement>('#parity-view .seg[data-pview="gaps"]')!.click();

@@ -1,20 +1,19 @@
 // Craft Status UI: renders the snapshot pushed by the Rust poller. main.ts
 // picks the Tauri API, or a browser stand-in, and calls `start`.
 
-import { PARITY_FIGURES, figurePct, formatPct, parityTip, parityUrl } from './model.ts';
-import type { ParityField } from './model.ts';
 import {
+  COLUMNS, RECENT, WINDOWS, MANUAL, windowById, value, orderedEntries, nextSort, dropIndex,
+  freshness, ago, totals, urgentAcross, tokenStatus, isRefreshing,
+  PARITY_FIGURES, figurePct, formatPct, parityTip, parityUrl,
   AUDIENCES, BASIS_BADGE, GAP_KINDS, NO_GAP_FILTER, PARITY_COLUMNS, PARITY_WARN_DAYS, allGaps, areaStrip, areasByDrag,
   audienceFigure, betaUnknownWhy, blocksLabel, cellValue, changedAt, checklistSummary, daysSince, dimScore, dimsByDrag, docUrl,
   figureSrc, gapKinds, gapTotal, hasParity, heatMeans, heatOf, hoursText, kindSums, nextGapSort, parityBadge,
   parityNextSort, parityOrder, partText, reviewAgeDays, scoreText, sourceUrl, stageOf, sumText, whyMissing,
 } from './model.ts';
-import type { Audience, Canonical, Cell, Figure, Gap, GapFilter, Hours, Link, Parity, Src } from './model.ts';
-import {
-  COLUMNS, RECENT, WINDOWS, MANUAL, windowById, value, orderedEntries, nextSort, dropIndex,
-  freshness, ago, totals, urgentAcross, tokenStatus, isRefreshing,
+import type {
+  Column, Meta, RepoEntry, Snapshot, Sort, ParityField,
+  Area, Audience, Canonical, Cell, Checklist, Counts, Dim, DocFile, Figure, Gap, GapFilter, Hours, Link, Parity, Src, StageStep,
 } from './model.ts';
-import type { Column, Meta, RepoEntry, Snapshot, Sort } from './model.ts';
 
 /** What the UI needs from the host: Tauri commands and events, window chrome. */
 export interface Api {
@@ -93,6 +92,52 @@ const shortName = (repo: string): string => repo.split('/').pop() ?? repo;
 const classes = (...cs: (string | false | null | undefined)[]): string => cs.filter(Boolean).join(' ');
 const DAY = 86400e3;
 
+/** The App cell's tooltip for a repo with parity numbers, or one not read or not accessible. */
+function appReadTip(e: RepoEntry, p: Parity | null | undefined): string {
+  if (e.inaccessible) return 'Not accessible';
+  return p ? `Read at ${p.commit?.slice(0, 7) ?? 'HEAD'}` : 'Not read yet';
+}
+
+/** One line of the Stage chip's tooltip: the next stage, its points and its hours. */
+function stepText(st: StageStep): string {
+  const points = st.points === null ? '' : `, ${st.points} points`;
+  const hours = st.hours ? `, ${hoursText(st.hours)}` : '';
+  return `next: ${st.stage}${points}${hours}`;
+}
+
+/** A parity document's dates in the Freshness strip; without a date line, why, and its last commit time. */
+function fileDates(f: DocFile): string {
+  if (f.why) {
+    const when = f.commit_date ? `: ${localTime(f.commit_date)}` : '';
+    return `${f.why}${when}`;
+  }
+  return [f.reviewed && `reviewed ${f.reviewed}`, f.updated && `updated ${f.updated}`, f.generated && `generated ${f.generated}`].filter(Boolean).join(' · ');
+}
+
+/** A dimension's tooltip: its name, the one table it is in, and whether it is part of the row above. */
+function dimTip(d: Dim): string {
+  const lines = [d.name];
+  if (d.only_in) lines.push(`Only in the ${d.only_in === 'w' ? 'weight' : 'By-dimension'} table`);
+  if (d.child) lines.push('Part of the row above; left out of the sums');
+  return lines.join('\n');
+}
+
+/** A checklist tier's tooltip: its rows by status. */
+function tierTip(x: Counts): string {
+  const parts = [`${x.done} done`];
+  if (x.ahead) parts.push(`${x.ahead} ahead`);
+  parts.push(`${x.partial} partial`, `${x.missing} missing`, `${x.excluded} out of scope`);
+  if (x.unrecognized) parts.push(`${x.unrecognized} unrecognized`);
+  if (x.not_measured) parts.push(`${x.not_measured} not measured`);
+  return parts.join(', ');
+}
+
+/** The heading of the detail pane's areas table, saying when it is sorted by hours and why. */
+function areasHeading(byHours: boolean, why: string | null): string {
+  if (!byHours) return 'Areas';
+  return why ? `Areas (sorted by hours: ${why})` : 'Areas (sorted by hours)';
+}
+
 /** The toolbar's refresh arrow, as an element (SVG needs its namespace). */
 function refreshIcon(): SVGSVGElement {
   const ns = 'http://www.w3.org/2000/svg';
@@ -138,7 +183,8 @@ export function start(api: Api): () => void {
     if (!p) return el('span', { class: 'muted', title }, text);
     const f = p[field];
     const url = parityUrl(entry.repo, p, f);
-    const shown = url ? link(text, url, f.state === 'ok' ? '' : 'muted') : el('span', { class: 'muted' }, text);
+    const cls = f.state === 'ok' ? '' : 'muted';
+    const shown = url ? link(text, url, cls) : el('span', { class: 'muted' }, text);
     return el('span', { class: 'parity', title }, f.state === 'unreadable' && el('span', { class: 'warn-dot', 'aria-hidden': 'true' }), shown);
   }
 
@@ -486,58 +532,80 @@ export function start(api: Api): () => void {
   const parityGroup = (key: string): string => PARITY_GROUP[key] ?? (key.startsWith('heat_') ? 'Dimensions' : '');
   const parityGroupStart = (i: number): boolean => i > 0 && parityGroup(PARITY_COLUMNS[i - 1]!.key) !== parityGroup(PARITY_COLUMNS[i]!.key);
 
+  /** The App column's cell: the app's icon and name, titled with why it has no numbers or the commit read. */
+  function appNameCell(e: RepoEntry): HTMLElement {
+    const p = e.parity;
+    const tip = p?.na ?? appReadTip(e, p);
+    return el('span', { class: 'repo', title: tip }, appIcon(e), shortName(e.repo), p?.na ? el('span', { class: 'na' }, 'n/a') : null);
+  }
+
+  /** The Stage column's chip, titled with the next steps and where the stage was read. */
+  function stageCell(e: RepoEntry, p: Parity): HTMLElement {
+    const s = stageOf(p);
+    if (!s) return dash(p.stage);
+    const steps = cellValue(p.stage)?.steps.map(stepText) ?? [];
+    const from = p.stage.state === 'ok' && p.stage.from ? [`From ${p.stage.from}`] : [];
+    const chip = srcLink(e.repo, p, p.stage.state === 'ok' ? p.stage.src : null, s, classes('stage', s.replace(' ', '-')));
+    chip.title = [...steps, ...from].join('\n');
+    return chip;
+  }
+
+  /** The Top drag column's cell: the dimension that loses the most weighted points. */
+  function topDragCell(repo: string, p: Parity): HTMLElement {
+    const d = p.top_drag;
+    if (d.state !== 'ok') return dash(d);
+    const name = d.v.name.split(' (')[0]!;
+    return el('span', { title: `${d.v.name}: ${d.v.points} weighted points lost` }, srcLink(repo, p, d.src, `${name} −${d.v.points.toFixed(1)}`));
+  }
+
+  /** The Beta gaps column's cell: the open gaps that block beta and their hours. */
+  function betaGapsCell(p: Parity): HTMLElement {
+    const t = p.gap_totals;
+    if (t.beta_unknown) return el('span', { class: 'muted', title: betaUnknownWhy(p) }, '—');
+    const b = t.beta;
+    const part = t.partial ? `\n+ ${partText(t.partial)}` : '';
+    return el('span', { title: `Open gaps that block beta${part}` }, b ? `${b.count} · ${sumText(b)}` : '0');
+  }
+
+  /** The Checklist column's cell. */
+  function checklistCell(p: Parity): HTMLElement {
+    const c = checklistSummary(p);
+    return el('span', { class: c.text === '—' ? 'muted' : '', title: c.title }, c.text);
+  }
+
+  /** The Reviewed column's cell: the age of the oldest Last reviewed date, marked when it is old. */
+  function reviewedCell(p: Parity, snap: Snapshot, now: number): HTMLElement {
+    const age = reviewAgeDays(p, now);
+    const dates = p.files.filter((f) => ['ROADMAP.md', 'docs/target-app-parity.md', 'docs/gaps.md'].includes(f.path))
+      .map((f) => `${f.path}: reviewed ${f.reviewed ?? '—'}, updated ${f.updated ?? '—'}`);
+    if (age === null) return el('span', { class: 'muted', title: dates.join('\n') || 'No Last reviewed date' }, '—');
+    return el('span', { class: age > warnDays(snap) ? 'old' : '', title: [`Oldest Last reviewed: ${p.reviewed}`, ...dates].join('\n') }, `${age}d`);
+  }
+
+  /** The Changed column's cell: the time since the last commit to a parity document. */
+  function changedCell(p: Parity, now: number): HTMLElement {
+    const t = changedAt(p);
+    return el('span', { class: t ? '' : 'muted', title: t ? `Last commit to a parity document: ${localTime(t)}` : 'Last commits not read' }, t ? ago(t, now) : '—');
+  }
+
   /** An Apps row's cell for column `key`. */
   function appCell(e: RepoEntry, key: string, snap: Snapshot, now: number): Node {
     const p = e.parity;
-    if (key === 'app') {
-      const tip = p?.na ?? (e.inaccessible ? 'Not accessible' : p ? `Read at ${p.commit?.slice(0, 7) ?? 'HEAD'}` : 'Not read yet');
-      return el('span', { class: 'repo', title: tip }, appIcon(e), shortName(e.repo), p?.na ? el('span', { class: 'na' }, 'n/a') : null);
-    }
+    if (key === 'app') return appNameCell(e);
     if (!p || e.inaccessible) return el('span', { class: 'muted', title: e.inaccessible ? 'Not accessible' : 'Not read yet' }, '—');
-    if (key === 'stage') {
-      const s = stageOf(p);
-      if (!s) return dash(p.stage);
-      const steps = cellValue(p.stage)?.steps.map((st) => `next: ${st.stage}${st.points !== null ? `, ${st.points} points` : ''}${st.hours ? `, ${hoursText(st.hours)}` : ''}`) ?? [];
-      const from = p.stage.state === 'ok' && p.stage.from ? [`From ${p.stage.from}`] : [];
-      const chip = srcLink(e.repo, p, p.stage.state === 'ok' ? p.stage.src : null, s, classes('stage', s.replace(' ', '-')));
-      chip.title = [...steps, ...from].join('\n');
-      return chip;
-    }
+    if (key === 'stage') return stageCell(e, p);
     if (p.na) return el('span', { class: 'muted', title: p.na }, '');
     switch (key) {
       case 'ready': return readyBar(e, p);
       case 'breadth': return figureCell(e.repo, p, p.breadth);
       case 'to_beta': return hoursCell(e.repo, p, p.to_beta);
       case 'to_full': return hoursCell(e.repo, p, p.to_full);
-      case 'top_drag': {
-        const d = p.top_drag;
-        if (d.state !== 'ok') return dash(d);
-        const name = d.v.name.split(' (')[0]!;
-        return el('span', { title: `${d.v.name}: ${d.v.points} weighted points lost` }, srcLink(e.repo, p, d.src, `${name} −${d.v.points.toFixed(1)}`));
-      }
-      case 'beta_gaps': {
-        const t = p.gap_totals;
-        if (t.beta_unknown) return el('span', { class: 'muted', title: betaUnknownWhy(p) }, '—');
-        const b = t.beta;
-        const part = t.partial ? `\n+ ${partText(t.partial)}` : '';
-        return el('span', { title: `Open gaps that block beta${part}` }, b ? `${b.count} · ${sumText(b)}` : '0');
-      }
+      case 'top_drag': return topDragCell(e.repo, p);
+      case 'beta_gaps': return betaGapsCell(p);
       case 'areas': return stripCell(p);
-      case 'checklist': {
-        const c = checklistSummary(p);
-        return el('span', { class: c.text === '—' ? 'muted' : '', title: c.title }, c.text);
-      }
-      case 'reviewed': {
-        const age = reviewAgeDays(p, now);
-        const dates = p.files.filter((f) => ['ROADMAP.md', 'docs/target-app-parity.md', 'docs/gaps.md'].includes(f.path))
-          .map((f) => `${f.path}: reviewed ${f.reviewed ?? '—'}, updated ${f.updated ?? '—'}`);
-        if (age === null) return el('span', { class: 'muted', title: dates.join('\n') || 'No Last reviewed date' }, '—');
-        return el('span', { class: age > warnDays(snap) ? 'old' : '', title: [`Oldest Last reviewed: ${p.reviewed}`, ...dates].join('\n') }, `${age}d`);
-      }
-      case 'changed': {
-        const t = changedAt(p);
-        return el('span', { class: t ? '' : 'muted', title: t ? `Last commit to a parity document: ${localTime(t)}` : 'Last commits not read' }, t ? ago(t, now) : '—');
-      }
+      case 'checklist': return checklistCell(p);
+      case 'reviewed': return reviewedCell(p, snap, now);
+      case 'changed': return changedCell(p, now);
     }
     if (key.startsWith('heat_')) return heatCell(e, p, key.slice(5) as Canonical);
     return document.createTextNode('');
@@ -625,18 +693,16 @@ export function start(api: Api): () => void {
 
   function gapFilters(snap: Snapshot): HTMLElement {
     const setFilter = (patch: Partial<GapFilter>) => { state.gapFilter = { ...state.gapFilter, ...patch }; save('gapFilter', state.gapFilter); render(); };
-    if (!gapControls) {
-      gapControls = el('span', { class: 'gap-filters' },
-        el('select', { id: 'gap-repo', 'aria-label': 'App', onchange: (ev: Event) => setFilter({ repo: (ev.target as HTMLSelectElement).value }) }),
-        el('select', { id: 'gap-kind', 'aria-label': 'Kind', onchange: (ev: Event) => setFilter({ kind: (ev.target as HTMLSelectElement).value }) },
-          el('option', { value: '' }, 'All kinds'), [...GAP_KINDS, 'other'].map((k) => el('option', { value: k }, k))),
-        el('label', { class: 'toggle' }, el('input', { type: 'checkbox', id: 'gap-beta', onchange: (ev: Event) => setFilter({ betaOnly: (ev.target as HTMLInputElement).checked }) }), 'Blocks beta'),
-        el('label', { class: 'toggle' }, el('input', { type: 'checkbox', id: 'gap-closed', onchange: (ev: Event) => setFilter({ hideClosed: (ev.target as HTMLInputElement).checked }) }), 'Hide closed'),
-        el('label', { class: 'toggle' }, 'Min hours', el('input', { type: 'number', id: 'gap-hours', min: 0, step: 10, 'aria-label': 'Minimum hours',
-          oninput: (ev: Event) => setFilter({ minHours: Number((ev.target as HTMLInputElement).value) || 0 }) })),
-        el('input', { type: 'search', id: 'gap-text', placeholder: 'Filter text', 'aria-label': 'Filter text', spellcheck: 'false',
-          oninput: (ev: Event) => setFilter({ text: (ev.target as HTMLInputElement).value }) }));
-    }
+    gapControls ??= el('span', { class: 'gap-filters' },
+      el('select', { id: 'gap-repo', 'aria-label': 'App', onchange: (ev: Event) => setFilter({ repo: (ev.target as HTMLSelectElement).value }) }),
+      el('select', { id: 'gap-kind', 'aria-label': 'Kind', onchange: (ev: Event) => setFilter({ kind: (ev.target as HTMLSelectElement).value }) },
+        el('option', { value: '' }, 'All kinds'), [...GAP_KINDS, 'other'].map((k) => el('option', { value: k }, k))),
+      el('label', { class: 'toggle' }, el('input', { type: 'checkbox', id: 'gap-beta', onchange: (ev: Event) => setFilter({ betaOnly: (ev.target as HTMLInputElement).checked }) }), 'Blocks beta'),
+      el('label', { class: 'toggle' }, el('input', { type: 'checkbox', id: 'gap-closed', onchange: (ev: Event) => setFilter({ hideClosed: (ev.target as HTMLInputElement).checked }) }), 'Hide closed'),
+      el('label', { class: 'toggle' }, 'Min hours', el('input', { type: 'number', id: 'gap-hours', min: 0, step: 10, 'aria-label': 'Minimum hours',
+        oninput: (ev: Event) => setFilter({ minHours: Number((ev.target as HTMLInputElement).value) || 0 }) })),
+      el('input', { type: 'search', id: 'gap-text', placeholder: 'Filter text', 'aria-label': 'Filter text', spellcheck: 'false',
+        oninput: (ev: Event) => setFilter({ text: (ev.target as HTMLInputElement).value }) }));
     // A filter for a repo no longer configured is cleared; one whose report
     // is not read yet keeps its option.
     if (state.gapFilter.repo && !snap.repos.some((e) => e.repo === state.gapFilter.repo)) {
@@ -769,44 +835,65 @@ export function start(api: Api): () => void {
     const repo = e.repo;
     const stage = stageOf(p);
     const target = p.files.find((f) => f.target)?.target;
+    const head = el('div', { class: 'detail-head' }, appIcon(e), el('h2', {}, shortName(repo)),
+      stage && el('span', { class: classes('stage', stage.replace(' ', '-')) }, stage),
+      target && el('span', { class: 'muted target' }, `vs ${target}`), close);
+    const { dims, byHours } = dimsByDrag(p.dims);
+    const ar = areasByDrag(p.areas);
+    const areas = ar.areas.length ? areaTable(repo, p, ar.areas) : null;
+    const checks = p.checklists.map((c) => checklistBlock(repo, p, c));
+
+    replaceDetail(pane, repo, head, detailNumbers(repo, p),
+      section('Freshness', el('div', { class: 'fresh-strip' }, p.files.map((f) => freshChip(repo, p, f)))),
+      section(byHours ? 'Holding it back (sorted by hours: no weights in source)' : 'Holding it back', dimTable(repo, p, dims),
+        areas && el('h4', {}, areasHeading(ar.byHours, p.area_weights_why)), areas,
+        areas && el('p', { class: 'muted small' }, 'The Missing chips are read from the area’s gaps text; the text itself is under each row.')),
+      gapSection(repo, p),
+      section('Checklists', ...(checks.length ? checks : [el('p', { class: 'muted' }, 'No machine checklist in this repo.')]), checklistDocs(repo, p)),
+      section('Parser notes', parserNotes(repo, p)));
+  }
+
+  /** The detail pane's headline numbers: the readiness figures and the hours to each stage. */
+  function detailNumbers(repo: string, p: Parity): HTMLElement {
     const number = (label: string, f: Figure) => el('div', { class: 'number' }, el('span', { class: 'label' }, label), figureCell(repo, p, f),
       f.state === 'ok' && f.low !== null && f.high !== null && el('span', { class: 'range-text' }, `${f.low}–${f.high}%`),
       f.state === 'ok' && BASIS_BADGE[f.basis] && el('span', { class: `basis ${f.basis}` }, BASIS_BADGE[f.basis]));
     const hoursNumber = (label: string, c: Cell<Hours>) =>
       el('div', { class: 'number' }, el('span', { class: 'label' }, label), hoursCell(repo, p, c));
-    const head = el('div', { class: 'detail-head' }, appIcon(e), el('h2', {}, shortName(repo)),
-      stage && el('span', { class: classes('stage', stage.replace(' ', '-')) }, stage),
-      target && el('span', { class: 'muted target' }, `vs ${target}`), close);
-    const numbers = el('div', { class: 'numbers' },
+    return el('div', { class: 'numbers' },
       number('Breadth', p.breadth), number('Ready', p.ready), number('Mainstream', p.mainstream), number('Essentials', p.essentials),
       hoursNumber('To alpha', p.to_alpha), hoursNumber('To beta', p.to_beta), hoursNumber('To full', p.to_full));
+  }
 
-    const fresh = el('div', { class: 'fresh-strip' }, p.files.map((f) => {
-      const name = f.path.split('/').pop() ?? f.path;
-      const dates = f.why
-        ? `${f.why}${f.commit_date ? `: ${localTime(f.commit_date)}` : ''}`
-        : [f.reviewed && `reviewed ${f.reviewed}`, f.updated && `updated ${f.updated}`, f.generated && `generated ${f.generated}`].filter(Boolean).join(' · ');
-      const tip = [f.path, f.date_lines > 1 ? `${f.date_lines} date lines` : '', f.commit_date ? `Last commit ${localTime(f.commit_date)}` : 'Last commit not read']
-        .filter(Boolean).join('\n');
-      return el('span', { class: classes('fresh-chip', !!f.why && 'nodate'), title: tip },
-        srcLink(repo, p, { path: f.path, line: f.line ?? 0 }, name), el('span', { class: 'muted' }, ` ${dates || '—'}`));
-    }));
+  /** One parity document's chip in the Freshness strip. */
+  function freshChip(repo: string, p: Parity, f: DocFile): HTMLElement {
+    const name = f.path.split('/').pop() ?? f.path;
+    const dates = fileDates(f);
+    const tip = [f.path, f.date_lines > 1 ? `${f.date_lines} date lines` : '', f.commit_date ? `Last commit ${localTime(f.commit_date)}` : 'Last commit not read']
+      .filter(Boolean).join('\n');
+    return el('span', { class: classes('fresh-chip', !!f.why && 'nodate'), title: tip },
+      srcLink(repo, p, { path: f.path, line: f.line ?? 0 }, name), el('span', { class: 'muted' }, ` ${dates || '—'}`));
+  }
 
-    const { dims, byHours } = dimsByDrag(p.dims);
-    const dimTable = dims.length ? el('table', { class: 'detail-table' },
+  /** The dimensions table, or why there is none. */
+  function dimTable(repo: string, p: Parity, dims: readonly Dim[]): HTMLElement {
+    if (!dims.length) return el('p', { class: 'muted' }, whyMissing(p.dims_total));
+    return el('table', { class: 'detail-table' },
       el('thead', {}, el('tr', {}, ['Dimension', 'Weight', 'Ready', 'Lost', 'Hours', 'Doc'].map((t) => el('th', {}, t)))),
       el('tbody', {}, dims.map((d) => el('tr', { class: d.child ? 'child muted' : '' },
-        el('td', { title: `${d.name}${d.only_in ? `\nOnly in the ${d.only_in === 'w' ? 'weight' : 'By-dimension'} table` : ''}${d.child ? '\nPart of the row above; left out of the sums' : ''}` },
-          d.child ? '↳ ' : '', srcLink(repo, p, d.src, d.name.split(' (')[0]!)),
+        el('td', { title: dimTip(d) }, d.child ? '↳ ' : '', srcLink(repo, p, d.src, d.name.split(' (')[0]!)),
         el('td', { title: d.weight_src ?? '' }, d.weight === null ? el('span', { class: 'muted', title: 'Not weighted' }, '—') : String(d.weight)),
         el('td', {}, d.fills === 'breadth' ? el('span', { title: 'Breadth row' }, `${scoreText(dimScore(d))} breadth`) : scoreText(d.ready)),
         el('td', {}, d.shortfall === null ? '' : `−${d.shortfall.toFixed(1)}`),
         el('td', { title: d.hours.state === 'ok' ? d.hours.v.raw : whyMissing(d.hours) }, hoursText(cellValue(d.hours))),
-        el('td', {}, docCell(repo, p, d.doc)))))) : el('p', { class: 'muted' }, whyMissing(p.dims_total));
-    const ar = areasByDrag(p.areas);
-    const areaTable = ar.areas.length ? el('table', { class: 'detail-table areas' },
+        el('td', {}, docCell(repo, p, d.doc))))));
+  }
+
+  /** The feature areas table, each row with its missing features and the gaps text under them. */
+  function areaTable(repo: string, p: Parity, areas: readonly Area[]): HTMLElement {
+    return el('table', { class: 'detail-table areas' },
       el('thead', {}, el('tr', {}, ['Area', 'Weight', 'Breadth', 'Ready', 'Hours', 'Missing'].map((t) => el('th', {}, t)))),
-      el('tbody', {}, ar.areas.map((a) => el('tr', { class: a.unweighted ? 'muted' : '' },
+      el('tbody', {}, areas.map((a) => el('tr', { class: a.unweighted ? 'muted' : '' },
         el('td', { title: a.full_name }, srcLink(repo, p, a.src, a.name), a.conflict && el('span', { class: 'warn', title: a.conflict }, ' ⚠'),
           a.unweighted && el('span', { class: 'na' }, 'unweighted')),
         el('td', { title: a.weight_src ?? p.area_weights_why ?? '' }, a.weight === null ? '—' : String(a.weight)),
@@ -817,8 +904,23 @@ export function start(api: Api): () => void {
           a.missing.map((c) => el('span', { class: 'chip', title: c.hover ?? '' }, c.text)),
           a.more ? el('span', { class: 'chip more' }, `+${a.more} more`) : null,
           !a.missing.length && el('span', { class: 'muted' }, a.raw_gaps ? 'show text' : '—')),
-          el('p', { class: 'raw' }, a.raw_gaps || '(empty)'))))))) : null;
+          el('p', { class: 'raw' }, a.raw_gaps || '(empty)')))))));
+  }
 
+  /** The sums under the ranked gaps, or why the beta blockers are unknown; null when the report has no gaps. */
+  function gapTotalsLine(p: Parity): HTMLElement | null {
+    if (!p.gaps.length) return null;
+    const t = p.gap_totals;
+    if (t.beta_unknown) return el('p', { class: 'gap-totals muted' }, `${betaUnknownWhy(p)}.`);
+    return el('p', { class: 'gap-totals' },
+      t.beta ? `Σ beta gaps ${sumText(t.beta)} (${t.beta.count})` : 'No beta gaps',
+      t.partial ? ` + ${partText(t.partial)}` : '',
+      t.stated.state === 'ok' ? `; docs/gaps.md says ${hoursText(t.stated.v)}` : '',
+      p.to_beta.state === 'ok' ? `; ROADMAP says ${hoursText(p.to_beta.v)} to beta` : '');
+  }
+
+  /** The Ranked gaps section: the ranked table, the sums, and a table for each group of unranked gaps. */
+  function gapSection(repo: string, p: Parity): HTMLElement {
     const gaps = p.gaps.filter((g) => !state.detailBetaOnly || g.beta === 'yes');
     const ranked = gaps.filter((g) => g.rank > 0);
     const unranked = gaps.filter((g) => g.rank === 0);
@@ -831,51 +933,51 @@ export function start(api: Api): () => void {
       el('td', {}, docCell(repo, p, g.doc)));
     const gapHead = el('thead', {}, el('tr', {}, ['#', 'Id', 'Gap', 'Blocks', 'Kind', 'Hours', 'Doc'].map((t) => el('th', {}, t))));
     const groups = [...new Set(unranked.map((g) => g.group ?? ''))];
-    const t = p.gap_totals;
-    const totals = !p.gaps.length ? null : !t.beta_unknown ? el('p', { class: 'gap-totals' },
-      t.beta ? `Σ beta gaps ${sumText(t.beta)} (${t.beta.count})` : 'No beta gaps',
-      t.partial ? ` + ${partText(t.partial)}` : '',
-      t.stated.state === 'ok' ? `; docs/gaps.md says ${hoursText(t.stated.v)}` : '',
-      p.to_beta.state === 'ok' ? `; ROADMAP says ${hoursText(p.to_beta.v)} to beta` : '')
-      : el('p', { class: 'gap-totals muted' }, `${betaUnknownWhy(p)}.`);
-    const gapSection = section('Ranked gaps',
+    const rankedTable = ranked.length ? el('table', { class: 'detail-table gaps' }, gapHead, el('tbody', {}, ranked.map(gapRow))) : null;
+    const empty = !gaps.length && el('p', { class: 'muted' }, p.gaps.length ? 'None match.' : betaUnknownWhy(p));
+    return section('Ranked gaps',
       el('label', { class: 'toggle' }, el('input', { type: 'checkbox', id: 'detail-beta', dataset: { key: 'beta-only' }, checked: state.detailBetaOnly ? 'checked' : null,
         onchange: (ev: Event) => { state.detailBetaOnly = (ev.target as HTMLInputElement).checked; render(); } }), 'Beta blockers only'),
-      ranked.length ? el('table', { class: 'detail-table gaps' }, gapHead, el('tbody', {}, ranked.map(gapRow)))
-        : !gaps.length && el('p', { class: 'muted' }, p.gaps.length ? 'None match.' : betaUnknownWhy(p)),
-      totals,
+      rankedTable,
+      empty,
+      gapTotalsLine(p),
       ...groups.map((grp) => el('div', { class: 'unranked' }, el('h4', {}, grp || 'Unranked'),
         el('table', { class: 'detail-table gaps' }, el('tbody', {}, unranked.filter((g) => (g.group ?? '') === grp).map(gapRow))))));
+  }
 
-    const checks = p.checklists.map((c) => {
-      const title = srcLink(repo, p, { path: c.path, line: 0 }, c.path);
-      if (c.kind === 'presence') {
-        const tot = c.total.state === 'ok' ? `${c.total.v.done} of ${c.total.v.total}` : whyMissing(c.total);
-        const byGroup = new Map<string, typeof c.missing>();
-        for (const m of c.missing) byGroup.set(m.group, [...(byGroup.get(m.group) ?? []), m]);
-        return el('div', { class: 'checklist' }, el('h4', {}, title, ` · ${tot}`),
-          [...byGroup].map(([g, rows]) => el('details', { dataset: { key: `presence/${c.path}/${g}` } }, el('summary', {}, `${g || 'Missing'} (${rows.length})`),
-            el('ul', {}, rows.map((r) => el('li', {}, srcLink(repo, p, { path: c.path, line: r.line }, r.text)))))),
-          c.more ? el('p', { class: 'muted' }, `+${c.more} more`) : null);
-      }
-      const tiers = c.kind === 'tiered' ? c.tiers : c.groups;
-      return el('div', { class: 'checklist' }, el('h4', {}, title, c.overall !== null ? ` · ${formatPct(c.overall)}` : ''),
-        tiers.map((x) => {
-          const n = x.done + x.ahead + x.partial + x.missing + x.excluded || 1;
-          const tip = `${x.done} done${x.ahead ? `, ${x.ahead} ahead` : ''}, ${x.partial} partial, ${x.missing} missing, ${x.excluded} out of scope`
-            + `${x.unrecognized ? `, ${x.unrecognized} unrecognized` : ''}${x.not_measured ? `, ${x.not_measured} not measured` : ''}`;
-          return el('div', { class: 'tier', title: tip },
-            el('span', { class: 'tier-name' }, x.name),
-            el('span', { class: 'stack' }, (['done', 'ahead', 'partial', 'missing', 'excluded'] as const).map((k) =>
-              el('span', { class: `part ${k}`, style: `width: ${((x[k] / n) * 100).toFixed(1)}%` }))),
-            el('span', { class: 'tier-pct' }, x.pct === null ? '—' : formatPct(x.pct)));
-        }),
-        c.rows.length ? el('details', { dataset: { key: `rows/${c.path}` } }, el('summary', {}, `Partial and missing rows (${c.rows.length}${c.more ? `, +${c.more} more` : ''})`),
-          el('ul', {}, c.rows.map((r) => el('li', {}, el('span', { class: `row-status ${r.status.replace(' ', '-')}` }, r.status), ' ',
-            el('span', { class: 'muted' }, r.group), ' ', srcLink(repo, p, { path: c.path, line: r.line }, r.text),
-            r.notes && el('span', { class: 'muted' }, ` · ${r.notes}`))))) : null);
-    });
-    const docs = p.docs.length ? el('div', { class: 'checklist-docs' }, el('h4', {}, 'Checklist docs'),
+  /** One machine checklist: its total and missing rows by group, or its tiers or groups and the rows not done. */
+  function checklistBlock(repo: string, p: Parity, c: Checklist): HTMLElement {
+    const title = srcLink(repo, p, { path: c.path, line: 0 }, c.path);
+    if (c.kind === 'presence') {
+      const tot = c.total.state === 'ok' ? `${c.total.v.done} of ${c.total.v.total}` : whyMissing(c.total);
+      const byGroup = new Map<string, typeof c.missing>();
+      for (const m of c.missing) byGroup.set(m.group, [...(byGroup.get(m.group) ?? []), m]);
+      return el('div', { class: 'checklist' }, el('h4', {}, title, ` · ${tot}`),
+        [...byGroup].map(([g, rows]) => el('details', { dataset: { key: `presence/${c.path}/${g}` } }, el('summary', {}, `${g || 'Missing'} (${rows.length})`),
+          el('ul', {}, rows.map((r) => el('li', {}, srcLink(repo, p, { path: c.path, line: r.line }, r.text)))))),
+        c.more ? el('p', { class: 'muted' }, `+${c.more} more`) : null);
+    }
+    const tiers = c.kind === 'tiered' ? c.tiers : c.groups;
+    const more = c.more ? `, +${c.more} more` : '';
+    return el('div', { class: 'checklist' }, el('h4', {}, title, c.overall !== null ? ` · ${formatPct(c.overall)}` : ''),
+      tiers.map((x) => {
+        const n = x.done + x.ahead + x.partial + x.missing + x.excluded || 1;
+        return el('div', { class: 'tier', title: tierTip(x) },
+          el('span', { class: 'tier-name' }, x.name),
+          el('span', { class: 'stack' }, (['done', 'ahead', 'partial', 'missing', 'excluded'] as const).map((k) =>
+            el('span', { class: `part ${k}`, style: `width: ${((x[k] / n) * 100).toFixed(1)}%` }))),
+          el('span', { class: 'tier-pct' }, x.pct === null ? '—' : formatPct(x.pct)));
+      }),
+      c.rows.length ? el('details', { dataset: { key: `rows/${c.path}` } }, el('summary', {}, `Partial and missing rows (${c.rows.length}${more})`),
+        el('ul', {}, c.rows.map((r) => el('li', {}, el('span', { class: `row-status ${r.status.replace(' ', '-')}` }, r.status), ' ',
+          el('span', { class: 'muted' }, r.group), ' ', srcLink(repo, p, { path: c.path, line: r.line }, r.text),
+          r.notes && el('span', { class: 'muted' }, ` · ${r.notes}`))))) : null);
+  }
+
+  /** The hand-written parity documents, each with its score, counts, dates and rows; null when there are none. */
+  function checklistDocs(repo: string, p: Parity): HTMLElement | null {
+    if (!p.docs.length) return null;
+    return el('div', { class: 'checklist-docs' }, el('h4', {}, 'Checklist docs'),
       el('ul', {}, p.docs.map((d) => {
         const f = p.files.find((x) => x.path === d.path);
         const counts = d.counts ? `${d.counts.done} done · ${d.counts.partial} partial · ${d.counts.missing} missing` : '';
@@ -888,19 +990,14 @@ export function start(api: Api): () => void {
           rows.length ? el('details', { dataset: { key: `docrows/${d.path}` } }, el('summary', {}, 'Rows'),
             el('ul', {}, rows.map((r) => el('li', {}, el('span', { class: 'row-status' }, r.status), ' ',
               srcLink(repo, p, { path: d.path, line: r.line }, r.text))))) : null);
-      }))) : null;
+      })));
+  }
 
-    const notes = p.notes.length ? el('ul', { class: 'notes' }, p.notes.map((n) => el('li', { class: n.level },
-      n.src ? srcLink(repo, p, n.src, n.text) : n.text, n.src ? el('span', { class: 'muted' }, ` ${n.src.path}:${n.src.line}`) : null))) : el('p', { class: 'muted' }, 'None.');
-
-    replaceDetail(pane, repo, head, numbers,
-      section('Freshness', fresh),
-      section(byHours ? 'Holding it back (sorted by hours: no weights in source)' : 'Holding it back', dimTable,
-        areaTable && el('h4', {}, ar.byHours ? `Areas (sorted by hours${p.area_weights_why ? `: ${p.area_weights_why}` : ''})` : 'Areas'), areaTable,
-        areaTable && el('p', { class: 'muted small' }, 'The Missing chips are read from the area’s gaps text; the text itself is under each row.')),
-      gapSection,
-      section('Checklists', ...(checks.length ? checks : [el('p', { class: 'muted' }, 'No machine checklist in this repo.')]), docs),
-      section('Parser notes', notes));
+  /** The parser's notes about the documents, or "None.". */
+  function parserNotes(repo: string, p: Parity): HTMLElement {
+    if (!p.notes.length) return el('p', { class: 'muted' }, 'None.');
+    return el('ul', { class: 'notes' }, p.notes.map((n) => el('li', { class: n.level },
+      n.src ? srcLink(repo, p, n.src, n.text) : n.text, n.src ? el('span', { class: 'muted' }, ` ${n.src.path}:${n.src.line}`) : null)));
   }
 
   function renderParity(snap: Snapshot): void {

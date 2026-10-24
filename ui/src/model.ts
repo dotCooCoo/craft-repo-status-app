@@ -678,8 +678,9 @@ export function parityUrl(repo: string, p: Parity, f: Figure): string | null {
   const at = encodeURIComponent(p.commit ?? 'HEAD');
   if (p.parity_doc) return `https://github.com/${repo}/blob/${at}/docs/target-app-parity.md`;
   if (!p.roadmap_oid) return null;
-  const path = (f.state === 'absent' ? 'ROADMAP.md' : f.path).split('/').map(encodeURIComponent).join('/');
-  return `https://github.com/${repo}/blob/${at}/${path}${f.state === 'absent' ? '' : `?plain=1#L${f.line}`}`;
+  if (f.state === 'absent') return `https://github.com/${repo}/blob/${at}/ROADMAP.md`;
+  const path = f.path.split('/').map(encodeURIComponent).join('/');
+  return `https://github.com/${repo}/blob/${at}/${path}?plain=1#L${f.line}`;
 }
 
 /** The tooltip of a parity cell: the row and its basis, or why there is no number, and the review date. */
@@ -688,8 +689,7 @@ export function parityTip(p: Parity | null | undefined, field: ParityField): str
   const f = p[field];
   const lines: string[] = [];
   if (f.state === 'ok') {
-    lines.push(`${f.label}: ${f.text}`);
-    lines.push(f.kind ? `${BASIS_TEXT[f.basis]} · ${f.kind}` : BASIS_TEXT[f.basis]);
+    lines.push(`${f.label}: ${f.text}`, f.kind ? `${BASIS_TEXT[f.basis]} · ${f.kind}` : BASIS_TEXT[f.basis]);
     if (f.from) lines.push(`Source: ${f.from}`);
   } else {
     lines.push(f.why);
@@ -711,7 +711,8 @@ export function parityTip(p: Parity | null | undefined, field: ParityField): str
 export function sourceUrl(repo: string, commit: string | null | undefined, src: Src): string {
   const at = encodeURIComponent(commit ?? 'HEAD');
   const path = src.path.split('/').map(encodeURIComponent).join('/');
-  return `https://github.com/${repo}/blob/${at}/${path}${src.line ? `?plain=1#L${src.line}` : ''}`;
+  const anchor = src.line ? `?plain=1#L${src.line}` : '';
+  return `https://github.com/${repo}/blob/${at}/${path}${anchor}`;
 }
 
 /** A document link on GitHub at `commit`, at the section it names; null for a link outside the repo. */
@@ -754,8 +755,9 @@ export function sumText(s: HoursSum): string {
 
 /** The gaps that block beta in part, with the most hours they add. */
 export function partText(s: HoursSum): string {
-  const h = s.unknown >= s.count ? 'hours unknown' : `up to ${s.hi.toLocaleString('en-US')} h${s.unknown ? `, ${s.unknown} unestimated` : ''}`;
-  return `part of ${s.count} gaps (${h})`;
+  if (s.unknown >= s.count) return `part of ${s.count} gaps (hours unknown)`;
+  const unestimated = s.unknown ? `, ${s.unknown} unestimated` : '';
+  return `part of ${s.count} gaps (up to ${s.hi.toLocaleString('en-US')} h${unestimated})`;
 }
 
 /** Why a value is missing, for a dash's tooltip: the reason, and for an unreadable value its text and line. */
@@ -798,7 +800,8 @@ export const AUDIENCES: readonly { id: Audience; label: string }[] = [
 
 /** The readiness figure for an audience: Ready for the full target. */
 export function audienceFigure(p: Parity, a: Audience): Figure {
-  return a === 'full' ? p.ready : a === 'mainstream' ? p.mainstream : p.essentials;
+  if (a === 'full') return p.ready;
+  return a === 'mainstream' ? p.mainstream : p.essentials;
 }
 
 /** Whether the repo has parity documents (and has been read). */
@@ -837,6 +840,9 @@ const STAGES = ['pre-alpha', 'early alpha', 'alpha', 'beta', 'stable'];
 /** The stage's name, or null. */
 export const stageOf = (p: Parity | null | undefined): string | null => cellValue(p?.stage)?.name ?? null;
 
+/** The value a Parity tab column sorts by; null when there is none. */
+export type ParityValue = number | string | null;
+
 /** A column of the Apps table: its label, its tooltip, and the value it sorts by. */
 export interface ParityColumn {
   key: string;
@@ -844,7 +850,7 @@ export interface ParityColumn {
   title: string;
   /** Sorts ascending when first clicked. */
   asc?: boolean;
-  value: (e: RepoEntry, audience: Audience) => number | string | null;
+  value: (e: RepoEntry, audience: Audience) => ParityValue;
 }
 
 const readyFor = (e: RepoEntry, a: Audience): number | null => figurePct(e.parity && audienceFigure(e.parity, a));
@@ -1028,12 +1034,7 @@ export function allGaps(entries: readonly RepoEntry[], f: GapFilter = NO_GAP_FIL
     const p = e.parity!;
     const reviewed = p.files.find((x) => x.path === 'docs/gaps.md')?.reviewed ?? null;
     for (const g of p.gaps) {
-      if (f.hideClosed && g.closed) continue;
-      if (f.betaOnly && g.beta !== 'yes') continue;
-      if (f.kind && !gapKinds(g).includes(f.kind)) continue;
-      if (f.minHours > 0 && (cellValue(g.hours)?.hi ?? 0) < f.minHours) continue;
-      if (text && !`${g.title} ${g.id} ${e.repo}`.toLowerCase().includes(text)) continue;
-      out.push({ ...g, repo: e.repo, commit: p.commit, reviewed });
+      if (gapPasses(g, e.repo, f, text)) out.push({ ...g, repo: e.repo, commit: p.commit, reviewed });
     }
   }
   const hi = (g: Gap) => cellValue(g.hours)?.hi ?? -1;
@@ -1042,29 +1043,41 @@ export function allGaps(entries: readonly RepoEntry[], f: GapFilter = NO_GAP_FIL
     return out.sort((a, b) => gapBand(a) - gapBand(b) || rank(a) - rank(b) || hi(b) - hi(a) || a.repo.localeCompare(b.repo));
   }
   const sign = sort.dir === 'asc' ? 1 : -1;
-  const key = (g: AppGap): number | string | null => {
-    switch (sort.key) {
-      case 'app': return g.repo.split('/').pop() ?? g.repo;
-      case 'rank': return g.rank || null;
-      case 'id': return g.id || null;
-      case 'gap': return g.title;
-      case 'blocks': return gapBand(g);
-      case 'kind': return gapKinds(g)[0] ?? null;
-      case 'hours': return cellValue(g.hours)?.hi ?? null;
-      case 'doc': return g.doc?.text || null;
-      case 'reviewed': return g.reviewed;
-      default: return null;
-    }
-  };
-  return out.sort((a, b) => {
-    const va = key(a);
-    const vb = key(b);
-    if (va === null && vb === null) return 0;
-    if (va === null) return 1;
-    if (vb === null) return -1;
-    const d = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb), undefined, { numeric: true });
-    return sign * d;
-  });
+  return out.sort((a, b) => compareGapValues(gapSortValue(a, sort.key), gapSortValue(b, sort.key), sign));
+}
+
+/** Whether gap `g` of `repo` passes filter `f`; `text` is the filter's text, trimmed and in lower case. */
+function gapPasses(g: Gap, repo: string, f: GapFilter, text: string): boolean {
+  if (f.hideClosed && g.closed) return false;
+  if (f.betaOnly && g.beta !== 'yes') return false;
+  if (f.kind && !gapKinds(g).includes(f.kind)) return false;
+  if (f.minHours > 0 && (cellValue(g.hours)?.hi ?? 0) < f.minHours) return false;
+  return !text || `${g.title} ${g.id} ${repo}`.toLowerCase().includes(text);
+}
+
+/** The value the All gaps column `key` sorts a gap by; null when it has none. */
+function gapSortValue(g: AppGap, key: string): ParityValue {
+  switch (key) {
+    case 'app': return g.repo.split('/').pop() ?? g.repo;
+    case 'rank': return g.rank || null;
+    case 'id': return g.id || null;
+    case 'gap': return g.title;
+    case 'blocks': return gapBand(g);
+    case 'kind': return gapKinds(g)[0] ?? null;
+    case 'hours': return cellValue(g.hours)?.hi ?? null;
+    case 'doc': return g.doc?.text || null;
+    case 'reviewed': return g.reviewed;
+    default: return null;
+  }
+}
+
+/** Compares two All gaps sort values, ascending for `sign` 1 and descending for -1; a null sorts last either way. */
+function compareGapValues(va: ParityValue, vb: ParityValue, sign: number): number {
+  if (va === null && vb === null) return 0;
+  if (va === null) return 1;
+  if (vb === null) return -1;
+  const d = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb), undefined, { numeric: true });
+  return sign * d;
 }
 
 /**
@@ -1153,7 +1166,8 @@ export function dimsByDrag(dims: readonly Dim[]): { dims: Dim[]; byHours: boolea
   }
   const byHours = !dims.some((d) => !d.child && d.shortfall !== null);
   const key = (d: Dim) => (byHours ? cellValue(d.hours)?.hi ?? -1 : d.shortfall ?? -1);
-  return { dims: groups.sort((a, b) => key(b[0]!) - key(a[0]!)).flat(), byHours };
+  groups.sort((a, b) => key(b[0]!) - key(a[0]!));
+  return { dims: groups.flat(), byHours };
 }
 
 /** The areas in the same order. */
