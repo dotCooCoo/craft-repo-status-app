@@ -377,7 +377,8 @@ export function mainCiTip(ci: MainCi | null | undefined, time: (iso: Time) => st
 export function mainCiUrl(repo: string, ci: MainCi | null | undefined): string {
   const failed = ci?.workflows.flatMap((w) => w.runs).find(runFailed);
   if (failed?.url) return failed.url;
-  return `https://github.com/${repo}/actions?query=${encodeURIComponent(`branch:${ci?.branch || 'main'}`)}`;
+  const query = encodeURIComponent(`branch:${ci?.branch || 'main'}`);
+  return `https://github.com/${repo}/actions?query=${query}`;
 }
 
 // ───────────────────────────── freshness ─────────────────────────────
