@@ -103,11 +103,9 @@ pub fn read(out: &mut Parity, d: Option<&Doc>) {
         let t0 = tables[0];
         let has_beta_col = t0.col(&["beta", "b", "blocks beta"]).is_some();
         let impact_beta = t0.col(&["impact", "user impact"]).is_some_and(|c| {
-            t0.rows.iter().any(|r| {
-                r.cells
-                    .get(c)
-                    .is_some_and(|x| x.text.to_lowercase().contains("blocks beta"))
-            })
+            t0.rows
+                .iter()
+                .any(|r| r.cells.get(c).is_some_and(|x| impact_blocks_beta(&x.text)))
         });
         // A prose sentence names the gaps that block beta; it says nothing
         // about the others, which stay unknown.
@@ -343,7 +341,7 @@ fn table_gaps(d: &Doc, t: &Table, ctx: &Ctx, rank_from: u32, group: Option<Strin
         }
         if let Some(c) = t.cell(r, impact_col) {
             let l = c.text.trim().to_lowercase();
-            if l.contains("blocks beta") {
+            if impact_blocks_beta(&l) {
                 beta = Some(Flag::Yes);
                 src = Some("impact".into());
             } else if !l.is_empty() {
@@ -428,6 +426,18 @@ fn table_gaps(d: &Doc, t: &Table, ctx: &Ctx, rank_from: u32, group: Option<Strin
         }
     }
     out
+}
+
+/// Whether an Impact cell says the gap blocks beta: "blocks beta", but not
+/// "no longer blocks beta", "never blocks beta" or "not blocks beta".
+fn impact_blocks_beta(text: &str) -> bool {
+    let l = text.to_lowercase();
+    l.match_indices("blocks beta").any(|(i, _)| {
+        let before = l[..i].trim_end();
+        !["no longer", "never", "not", "nothing"]
+            .iter()
+            .any(|n| before.ends_with(n))
+    })
 }
 
 /// A Beta cell's flag, and a note: `B (pane)` is Beta with a scope note,
@@ -1175,6 +1185,27 @@ mod tests {
         assert_eq!(
             p.gap_totals.beta.map(|b| (b.count, b.lo, b.hi)),
             Some((1, 150, 250))
+        );
+    }
+
+    #[test]
+    fn an_impact_that_negates_blocks_beta_does_not_block_it() {
+        let p = gaps("| # | Gap | Impact | Estimate |\n|---|---|---|---|\n| G1 | A | blocks beta | 10 h |\n| G2 | B | No longer blocks beta | 20 h |\n| G3 | C | never blocks beta | 30 h |\n");
+        assert_eq!(
+            p.gaps.iter().map(|g| g.beta.clone()).collect::<Vec<_>>(),
+            [Flag::Yes, Flag::No, Flag::No]
+        );
+        assert_eq!(
+            p.gap_totals.beta.map(|b| (b.count, b.lo, b.hi)),
+            Some((1, 10, 10))
+        );
+        let p = gaps("| # | Gap | Beta | Impact |\n|---|---|---|---|\n| G1 | A | no | no longer blocks beta |\n");
+        assert_eq!(p.gaps[0].beta, Flag::No, "the Beta column's no stays");
+        let p = gaps("| # | Gap | Impact |\n|---|---|---|\n| G1 | A | no longer blocks beta |\n");
+        assert_ne!(
+            p.gaps[0].beta,
+            Flag::Yes,
+            "a table whose only Impact negates it"
         );
     }
 
