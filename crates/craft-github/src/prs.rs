@@ -2348,6 +2348,53 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn a_refresh_keeps_commit_pages_read_part_way_while_the_head_stays() {
+        let now = t("2026-10-17T12:00:00Z");
+        let fetch = |head: &str| {
+            let mut n = node(9, "OPEN", "2026-10-17T11:30:00Z");
+            n["headRefOid"] = json!(head);
+            n["commits"] = commits(250, 0, 100);
+            parse_pr(&n).unwrap()
+        };
+        let mut cache = PrCache::default();
+        cache.put(fetch("k249"), now);
+        // A call read one more page before the request cap ran out.
+        let rec = cache.records.get_mut(&9).unwrap();
+        let page = parse_commits(&commits(250, 100, 100), 0);
+        rec.contribution.commits.extend(page);
+        rec.contribution.commits_cursor = Some("k200".into());
+        // A comment brings a fetch of the same head: the pages stay.
+        cache.put(fetch("k249"), now);
+        let c = &cache.records[&9].contribution;
+        assert_eq!(
+            (c.commits.len(), c.commits_cursor.as_deref()),
+            (200, Some("k200"))
+        );
+        // A fetch of a new head starts over, whether the changed list or
+        // the sweep sees the head first.
+        let mut direct = cache.clone();
+        direct.put(fetch("k999"), now);
+        let c = &direct.records[&9].contribution;
+        assert_eq!(
+            (c.commits.len(), c.commits_cursor.as_deref()),
+            (100, Some("k100"))
+        );
+        let light = Light {
+            id: "PR_9".into(),
+            number: 9,
+            head_ref_oid: "k999".into(),
+            ..Default::default()
+        };
+        cache.records.get_mut(&9).unwrap().apply_light(&light, now);
+        cache.put(fetch("k999"), now);
+        let c = &cache.records[&9].contribution;
+        assert_eq!(
+            (c.commits.len(), c.commits_cursor.as_deref()),
+            (100, Some("k100"))
+        );
+    }
+
     /// A sweep answer with 130 checks on main, of which `flaky` (the 111th)
     /// fails, as many in the first page as `request` asks for, and no open
     /// pull request.
