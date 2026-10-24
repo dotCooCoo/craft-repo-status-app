@@ -709,24 +709,37 @@ export function stateTip(w: WorkState): string {
   if (w.state === NOT_READ_YET) {
     return 'Not read yet: the app has found this pull request but has not read its comments, reviews and events, so it has no work state yet.';
   }
-  const lines = [`${stateLabel(w.state)}${w.subtype ? ` (${w.subtype.replaceAll('_', ' ')})` : ''}`, `Rule ${w.rule}`];
-  if (w.evidence) {
-    const by = [w.evidence.author, shortDate(w.evidence.at)].filter(Boolean).join(', ');
-    lines.push(`“${w.evidence.quote}”${by ? ` (${by})` : ''}`);
-  }
+  const lines = [stateLabel(w.state) + subtypeText(w.subtype), `Rule ${w.rule}`];
+  if (w.evidence) lines.push(evidenceLine(w.evidence));
   if (w.guess) lines.push(`Read from a comment’s text, not from a GitHub field: ${w.why || 'matched a phrase list'}.`);
   else if (w.why) lines.push(`${w.why.charAt(0).toUpperCase()}${w.why.slice(1)}.`);
   if (w.low) lines.push('Low confidence.');
-  if (w.hold) {
-    const h = w.hold;
-    lines.push(`Held since ${shortDate(h.since)}${h.by ? ` by ${h.by}` : ''}, reason: ${h.category}${h.reaffirmed ? `, held again ${shortDate(h.reaffirmed)}` : ''}.`);
-  }
-  if (w.blocked_by.length) lines.push(`Waits for ${w.blocked_by.map((n) => `#${n}`).join(', ')}.`);
-  if (w.competing.length) lines.push(`Competes with ${w.competing.map((n) => `#${n}`).join(', ')}.`);
+  if (w.hold) lines.push(holdText(w.hold));
+  if (w.blocked_by.length) lines.push(`Waits for ${prRefs(w.blocked_by)}.`);
+  if (w.competing.length) lines.push(`Competes with ${prRefs(w.competing)}.`);
   if (w.also.length) lines.push(`Also matched: ${w.also.map(stateLabel).join(', ')}.`);
   if (w.flags.length) lines.push(`Flags: ${w.flags.map(flagLabel).join(', ')}.`);
   if (w.evidence?.url) lines.push('Click to open the comment.');
   return lines.join('\n');
+}
+
+/** Pull request numbers as "#1, #2". */
+export const prRefs = (numbers: readonly number[]): string => numbers.map((n) => `#${n}`).join(', ');
+
+/** A subtype in parentheses with spaces for underscores, after a state's label; '' for none. */
+const subtypeText = (subtype: string | null | undefined): string => (subtype ? ` (${subtype.replaceAll('_', ' ')})` : '');
+
+/** The sentence a state was read from, with its author and date. */
+function evidenceLine(e: Evidence): string {
+  const by = [e.author, shortDate(e.at)].filter(Boolean).join(', ');
+  return by ? `“${e.quote}” (${by})` : `“${e.quote}”`;
+}
+
+/** A hold: since when, by whom, why and when it was held again. */
+function holdText(h: Hold): string {
+  const by = h.by ? ` by ${h.by}` : '';
+  const again = h.reaffirmed ? `, held again ${shortDate(h.reaffirmed)}` : '';
+  return `Held since ${shortDate(h.since)}${by}, reason: ${h.category}${again}.`;
 }
 
 /** Who an item waits on first, for grouping; `unread` when its timeline has not been read. */
@@ -853,8 +866,11 @@ export const PEOPLE_COLUMNS: readonly PeopleColumn[] = [
   { key: 'reviews', label: 'Reviews given', title: 'Comments and reviews on other people’s pull requests in the window' },
 ];
 
+/** A column's value for sorting; null sorts last. */
+export type SortValue = number | string | null;
+
 /** The value of column `key` in `f`, for sorting; null sorts last. */
-export function personValue(f: PersonFigures, key: string): number | string | null {
+export function personValue(f: PersonFigures, key: string): SortValue {
   switch (key) {
     case 'person': return f.login.toLowerCase();
     case 'open': return f.open;
@@ -912,6 +928,13 @@ const ageSecs = (i: Item, now: number): number | null => (i.work.since ? Math.ma
 
 const STATE_ORDER = new Map(Object.keys(STATE_LABELS).map((s, i) => [s, i]));
 
+/** The median of `ascending`, a list sorted from smallest to largest; null when it is empty. */
+function medianOf(ascending: readonly number[]): number | null {
+  if (!ascending.length) return null;
+  const mid = ascending.length >> 1;
+  return ascending.length % 2 ? ascending[mid]! : (ascending[mid - 1]! + ascending[mid]!) / 2;
+}
+
 /** `items` grouped by who they wait on first, then by state (most items first), with the median and longest time in state and the five oldest. Items whose state has no known start count in the state but not in its ages, and list after the rest. */
 export function stateBreakdown(items: readonly Item[], now: number): { role: RoleGroup; states: StateTime[] }[] {
   const out: { role: RoleGroup; states: StateTime[] }[] = [];
@@ -924,14 +947,13 @@ export function stateBreakdown(items: readonly Item[], now: number): { role: Rol
       const known = list.filter((i) => ageSecs(i, now) !== null);
       const sorted = [...known].sort((a, b) => ageSecs(b, now)! - ageSecs(a, now)!);
       const ages = sorted.map((i) => ageSecs(i, now)!).reverse();
-      const mid = ages.length >> 1;
       return {
         state,
         items: list,
         guessed: list.filter((i) => i.work.guess).length,
         low: list.filter((i) => i.work.low).length,
-        medianSecs: !ages.length ? null : ages.length % 2 ? ages[mid]! : (ages[mid - 1]! + ages[mid]!) / 2,
-        maxSecs: ages.length ? ages[ages.length - 1]! : null,
+        medianSecs: medianOf(ages),
+        maxSecs: ages.at(-1) ?? null,
         oldest: [...sorted, ...list.filter((i) => ageSecs(i, now) === null)].slice(0, 5),
       };
     });
@@ -1004,7 +1026,7 @@ export const RANK_COLUMNS: Readonly<Record<RankMode, readonly RankColumn[]>> = {
 };
 
 /** The value of ranking column `key` for a person with figures `r`, for sorting; null sorts last. */
-export function rankValue(row: RankRow, r: Rank, key: string): number | string | null {
+export function rankValue(row: RankRow, r: Rank, key: string): SortValue {
   switch (key) {
     case 'person': return row.login.toLowerCase();
     case 'lines': return r.added + r.removed;
@@ -1055,7 +1077,8 @@ export function nextRankSort(sort: Sort, key: string): Sort {
 /** A sort that ranking `mode` has a column for; otherwise its default. */
 export function rankSortFor(sort: Sort, mode: RankMode): Sort {
   if (RANK_COLUMNS[mode].some((c) => c.key === sort.key)) return sort;
-  return { key: mode === 'merged' ? 'merged' : mode === 'maintainer' ? 'merges' : PRODUCT, dir: 'desc' };
+  if (mode === 'merged') return { key: 'merged', dir: 'desc' };
+  return { key: mode === 'maintainer' ? 'merges' : PRODUCT, dir: 'desc' };
 }
 
 /** The header while merged and closed pull requests load: "1,240 of 9,747 merged and 30 of 120 closed pull requests loaded"; '' once loaded. */
@@ -1156,7 +1179,6 @@ export function repoFigures(view: PeopleView, repo: string, window: string, now:
   const onMaintainer = items.filter((i) => i.work.waits_on.includes('maintainer')).sort((a, b) => age(b) - age(a));
   const queue = items.filter((i) => i.work.state === 'awaiting_first_maintainer_response');
   const queueAges = queue.map((i) => since(i.work.since, now)).filter((a): a is number => a !== null).sort((a, b) => a - b);
-  const mid = queueAges.length >> 1;
   const holdAge = (i: Item) => since(i.work.hold?.since, now) ?? -1;
   const holds = items.filter((i) => i.work.hold).sort((a, b) => holdAge(b) - holdAge(a));
   const conflicting = (i: Item) => i.work.state === 'merge_conflict' || i.work.flags.includes('conflict') || i.work.also.includes('merge_conflict');
@@ -1186,7 +1208,7 @@ export function repoFigures(view: PeopleView, repo: string, window: string, now:
     byRole,
     oldestOnMaintainer: onMaintainer[0] ?? null,
     firstQueue: queue.length,
-    firstQueueMedianSecs: !queueAges.length ? null : queueAges.length % 2 ? queueAges[mid]! : (queueAges[mid - 1]! + queueAges[mid]!) / 2,
+    firstQueueMedianSecs: medianOf(queueAges),
     holds,
     holdsConflicting: holds.filter(conflicting).length,
     parked: items.filter((i) => i.work.state === 'author_declared_hold'),
@@ -1252,14 +1274,19 @@ const waitsOnLogin = (item: Item, login: string): boolean => item.work.waits_for
 /** `item`'s blocker for `login`: the label of its work state, and whether that state is approved or ready to merge, waits on CI, on them, on someone else, or has not been read yet. */
 export function blockerOf(item: Item, login: string): Blocker {
   const w = item.work;
-  const tone: Tone = w.state === NOT_READ_YET ? 'unread'
-    : READY_STATES.has(w.state) ? 'ready'
-    : w.state === 'ci_running' ? 'ci'
-    : waitsOnLogin(item, login) ? 'me' : 'them';
   const label = w.state === 'depends_on_other_pr' && w.blocked_by.length
-    ? `Depends on ${w.blocked_by.map((n) => `#${n}`).join(', ')}`
+    ? `Depends on ${prRefs(w.blocked_by)}`
     : BLOCKER_LABELS[w.state] ?? stateLabel(w.state);
-  return { state: w.state, label, tone };
+  return { state: w.state, label, tone: toneOf(item, login) };
+}
+
+/** Whether `item` is approved or ready to merge, waits on CI, on `login`, on someone else, or has not been read yet. */
+function toneOf(item: Item, login: string): Tone {
+  const w = item.work;
+  if (w.state === NOT_READ_YET) return 'unread';
+  if (READY_STATES.has(w.state)) return 'ready';
+  if (w.state === 'ci_running') return 'ci';
+  return waitsOnLogin(item, login) ? 'me' : 'them';
 }
 
 /** Whether `item` is held for the owner: its state, a request that also carries a hold, or a hold that an earlier rule outranked. */
@@ -1291,7 +1318,7 @@ export const MINE_COLUMNS: readonly MineColumn[] = [
 ];
 
 /** The value of My PRs column `key` for `row`, for sorting; null sorts last. */
-export function mineValue(row: MineRow, key: string, login: string, now: number): number | string | null {
+export function mineValue(row: MineRow, key: string, login: string, now: number): SortValue {
   const i = row.item;
   switch (key) {
     case 'repo': return (i.repo.split('/').pop() ?? i.repo).toLowerCase();
@@ -1349,7 +1376,7 @@ const agoText = (iso: Time, now: number): string => {
 /** The hover text of a Reply chip: who asked, when and for what. */
 export function replyTip(r: Reply, now: number = Date.now()): string {
   const when = r.at ? agoText(r.at, now) : 'at an unknown time';
-  return `${r.by} asked ${when}${r.subtype ? ` (${r.subtype.replaceAll('_', ' ')})` : ''}, and you have not answered since.\nClick to open the request.`;
+  return `${r.by} asked ${when}${subtypeText(r.subtype)}, and you have not answered since.\nClick to open the request.`;
 }
 
 /** The hover text of a Held chip: for how long, by whom and why, or that an earlier rule decided the state. */

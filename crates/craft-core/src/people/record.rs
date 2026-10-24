@@ -56,6 +56,9 @@ pub struct PrRecord {
     pub merged_by: Option<String>,
     pub head_ref_name: String,
     pub head_ref_oid: String,
+    /// The branch the pull request merges into; its commit and file lists
+    /// hold what the head has that this branch does not.
+    pub base_ref_name: String,
     pub is_cross_repository: bool,
     pub maintainer_can_modify: bool,
     pub body: String,
@@ -100,7 +103,19 @@ pub struct Checks {
     pub rollup: Option<String>,
     /// The names of the head commit's failing checks.
     pub failing: Vec<String>,
+    /// Where the rest of the head commit's checks start, while `failing`
+    /// holds only the pages read so far.
+    pub contexts_cursor: Option<ContextsCursor>,
     pub suites: Vec<Suite>,
+}
+
+/// Where the rest of a commit's checks start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ContextsCursor {
+    /// The commit's node id.
+    pub commit: String,
+    pub after: String,
 }
 
 /// One check suite on the head commit.
@@ -188,10 +203,16 @@ pub struct Contribution {
     pub files_total: u64,
     /// Where the rest of the file list starts.
     pub files_cursor: Option<String>,
+    /// The head commit the file list was read at. The light sweep moves
+    /// [`PrRecord::head_ref_oid`] to a new head before a fetch reads the
+    /// new head's files.
+    pub files_head: String,
     pub commits: Vec<PrCommit>,
-    /// GitHub's count of commits; more than `commits` holds when the pull
-    /// request has over 100.
+    /// GitHub's count of commits; more than `commits` holds until the rest
+    /// of the list is fetched.
     pub commits_total: u64,
+    /// Where the rest of the commit list starts.
+    pub commits_cursor: Option<String>,
     pub merge_commit: Option<MergeCommit>,
     /// Who landed it: see [`super::merger`].
     pub merger: Option<String>,
@@ -325,6 +346,9 @@ impl PrRecord {
         let failed = matches!(light.rollup.as_deref(), Some("FAILURE" | "ERROR"));
         if new_head {
             self.checks.failing.clear();
+            self.checks.contexts_cursor = None;
+            // The old head's commit pages are not read on.
+            self.contribution.commits_cursor = None;
         }
         // A check suite that failed, recovered or ran again changes the
         // failing names, though the rollup may stay failed.
@@ -372,15 +396,43 @@ impl PrRecord {
         checks.set_mergeable(&new.checks.mergeable, &new.checks.merge_state, now);
         checks.rollup = new.checks.rollup.take();
         checks.failing = std::mem::take(&mut new.checks.failing);
+        checks.contexts_cursor = new.checks.contexts_cursor.take();
         checks.suites = std::mem::take(&mut new.checks.suites);
-        // File pages fetched after the first stay while the head is the same.
+        // File pages fetched after the first stay while the head they were
+        // read at and the base are the same.
+        let same_base = self.base_ref_name == new.base_ref_name;
         let (old, fresh) = (&self.contribution, &new.contribution);
         if old.files.len() > fresh.files.len()
             && old.files_total == fresh.files_total
-            && self.head_ref_oid == new.head_ref_oid
+            && old.files_head == new.head_ref_oid
+            && same_base
         {
             new.contribution.files = std::mem::take(&mut self.contribution.files);
             new.contribution.files_cursor = self.contribution.files_cursor.take();
+        }
+        new.contribution.files_head = new.head_ref_oid.clone();
+        // So do commit pages, while the base is the same and the new first
+        // page starts them: a whole list while it ends at the new head, and
+        // pages read part way while the head is the same.
+        let (old, fresh) = (&self.contribution, &new.contribution);
+        let starts_alike = old
+            .commits
+            .iter()
+            .zip(&fresh.commits)
+            .all(|(o, f)| o.oid == f.oid);
+        let ends_at_head = old
+            .commits
+            .last()
+            .is_some_and(|k| k.oid == new.head_ref_oid);
+        let part_way = old.commits_cursor.is_some() && self.head_ref_oid == new.head_ref_oid;
+        if old.commits.len() > fresh.commits.len()
+            && old.commits_total == fresh.commits_total
+            && same_base
+            && starts_alike
+            && (ends_at_head || part_way)
+        {
+            new.contribution.commits = std::mem::take(&mut self.contribution.commits);
+            new.contribution.commits_cursor = self.contribution.commits_cursor.take();
         }
         let derived = std::mem::take(&mut self.derived);
         let comments_total = self.comments_total;
@@ -746,6 +798,51 @@ mod tests {
         };
         r.apply_light(&pushed, now);
         assert!(r.checks.failing.is_empty() && r.needs_fetch());
+    }
+
+    #[test]
+    fn file_pages_read_at_an_earlier_head_are_not_kept() {
+        let now = t("2026-10-05T00:00:00Z");
+        let fetch = |head: &str| PrRecord {
+            number: 5,
+            head_ref_oid: head.into(),
+            contribution: Contribution {
+                files: vec![FileLines {
+                    path: format!("{head}/a"),
+                    ..Default::default()
+                }],
+                files_total: 2,
+                files_cursor: Some("f1".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut r = PrRecord::default();
+        r.merge_from(fetch("h1"), now);
+        // A later call read the second page.
+        r.contribution.files.push(FileLines {
+            path: "h1/b".into(),
+            ..Default::default()
+        });
+        r.contribution.files_cursor = None;
+        r.merge_from(fetch("h1"), now);
+        assert_eq!(r.contribution.files.len(), 2, "the same head keeps both");
+        // The sweep sees a push before the fetch of the new head.
+        let pushed = Light {
+            number: 5,
+            head_ref_oid: "h2".into(),
+            ..Default::default()
+        };
+        r.apply_light(&pushed, now);
+        r.merge_from(fetch("h2"), now);
+        let paths: Vec<_> = r
+            .contribution
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(paths, ["h2/a"]);
+        assert_eq!(r.contribution.files_cursor.as_deref(), Some("f1"));
     }
 
     #[test]

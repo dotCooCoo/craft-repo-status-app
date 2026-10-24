@@ -17,13 +17,17 @@
 //!   closed without merging, newest update first, each continued from where
 //!   the previous call stopped.
 //!
+//! Commit lists and the checks on a head are read in pages of 100: the
+//! records the backfill leaves fetched get the rest of theirs after it, and
+//! the sweep reads all of the checks on the default branch's head.
+//!
 //! The requests go one at a time, through the client given, which in the
 //! app sends them as background requests (see [`crate::gate`]). Once GitHub
 //! reports fewer points left than the floor, only the changed list runs.
 //!
-//! The backfill, the walks and the file lists send at most
-//! [`PrInput::max_requests`] requests in one call ([`RUN_REQUESTS`] in the
-//! app), so a first load is spread over many calls; the changed lists and
+//! The backfill, the commit and check lists, the walks and the file lists
+//! send at most [`PrInput::max_requests`] requests in one call
+//! ([`RUN_REQUESTS`] in the app), so a first load is spread over many calls; the changed lists and
 //! the sweep keep their own page limits ([`MAX_CHANGED_PAGES`],
 //! [`MAX_SWEEP_PAGES`]), so they finish whatever the cap leaves. The changed
 //! lists of the repositories whose records were checked longest ago go
@@ -46,8 +50,8 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use craft_core::people::record::{
-    Closer, Contribution, CrossSource, FileLines, Gap, Light, MainChecks, MergeCommit, PrCache,
-    PrCommit, PrRecord, PrState, Suite, TimelineItem,
+    Closer, ContextsCursor, Contribution, CrossSource, FileLines, Gap, Light, MainChecks,
+    MergeCommit, PrCache, PrCommit, PrRecord, PrState, Suite, TimelineItem,
 };
 use craft_core::people::roster::Fetched;
 use craft_core::people::{is_merge_commit, merger, parse_co_authors};
@@ -85,6 +89,7 @@ pub enum Stage {
     Changed,
     Sweep,
     Backfill,
+    Lists,
     MergedWalk,
     ClosedWalk,
     FileLists,
@@ -96,6 +101,7 @@ impl Stage {
             Stage::Changed => "changed lists",
             Stage::Sweep => "sweep",
             Stage::Backfill => "backfill",
+            Stage::Lists => "commit and check lists",
             Stage::MergedWalk => "merged walk",
             Stage::ClosedWalk => "closed walk",
             Stage::FileLists => "file lists",
@@ -134,6 +140,8 @@ pub struct PrReport {
     pub closed: usize,
     /// File-list pages read.
     pub file_pages: usize,
+    /// Commit-list and check-list pages read after the first.
+    pub list_pages: usize,
     /// Requests sent in all, and how many times a smaller query was asked
     /// for because GitHub could not finish one.
     pub requests: usize,
@@ -397,8 +405,14 @@ impl<'a> Pass<'a> {
     /// into `cache`. A pull request read for the first time (not held, or
     /// held only as a sweep's record that was never fetched) with fewer
     /// than [`TL_NEW`] items whose timeline filled them all is marked for
-    /// the backfill, which reads more. Returns how many there were and the
-    /// newest and oldest `updatedAt` among them.
+    /// the backfill, which reads more. So is a fetched one whose items,
+    /// only the newest of its timeline, include none of the items it kept:
+    /// the items between them were missed, so the kept ones go and the
+    /// backfill reads the newest [`TL_NEW`]. A record marked for the
+    /// backfill stays marked through such reads while it holds fewer than
+    /// the newest [`TL_NEW`] items.
+    /// Returns how many there were and the newest and oldest `updatedAt`
+    /// among them.
     fn take(
         &self,
         cache: &mut PrCache,
@@ -418,13 +432,24 @@ impl<'a> Pass<'a> {
             };
             let number = rec.number;
             let full = tl < TL_NEW && rec.timeline.len() as u64 >= tl;
-            let new = cache
-                .records
-                .get(&number)
-                .is_none_or(|r| r.fetched_at.is_none());
+            let held = cache.records.get_mut(&number);
+            let new = held.as_ref().is_none_or(|r| r.fetched_at.is_none());
+            let was_stale = held.as_ref().is_some_and(|r| r.stale);
+            let gap = match held {
+                Some(r) if !new && misses_kept_items(r, &rec) => {
+                    r.timeline.clear();
+                    true
+                }
+                _ => false,
+            };
             cache.put(rec, self.now);
-            if let (true, Some(r)) = (new && full, cache.records.get_mut(&number)) {
-                r.stale = true;
+            if let Some(r) = cache.records.get_mut(&number) {
+                // A record still waiting for the backfill stays marked while
+                // it holds fewer than the newest items the backfill reads.
+                let short = (r.timeline.len() as u64) < r.timeline_total.min(TL_NEW);
+                if full && (new || gap || (was_stale && short)) {
+                    r.stale = true;
+                }
             }
             n += 1;
         }
@@ -561,7 +586,19 @@ impl<'a> Pass<'a> {
             let v = self.repo_query(SWEEP_QUERY, repo, vars)?;
             let r = &v["repository"];
             if page == 0 {
-                cache.main_checks = parse_main(&r["defaultBranchRef"]["target"]);
+                let target = &r["defaultBranchRef"]["target"];
+                let mut main = parse_main(target);
+                let mut next = contexts_cursor(target);
+                // Below the floor the checks read before stay.
+                while let (Some(m), Some(at)) = (main.as_mut(), next.take()) {
+                    if self.low() {
+                        self.note_low();
+                        return Ok(false);
+                    }
+                    self.count();
+                    next = self.contexts_page(&at, &mut m.failing)?;
+                }
+                cache.main_checks = main;
                 if let Some(me) = login(&v["viewer"]) {
                     self.update(|r| r.viewer = Some(me));
                 }
@@ -691,6 +728,85 @@ impl<'a> Pass<'a> {
             }
             Ok(vec![])
         })
+    }
+
+    /// Reads one page of the checks on a commit, from `at`, adds the names
+    /// of the failing ones to `failing`, and returns where the next page
+    /// starts. The caller has counted the request.
+    fn contexts_page(
+        &self,
+        at: &ContextsCursor,
+        failing: &mut Vec<String>,
+    ) -> Result<Option<ContextsCursor>> {
+        let vars = json!({ "id": at.commit, "after": at.after });
+        let v = self.gh.graphql_body(CONTEXTS_QUERY, vars)?;
+        self.update(|r| r.list_pages += 1);
+        let data = &v["data"];
+        self.note(data);
+        let errs = graphql_errors(&v);
+        if !errs.is_empty() {
+            return Err(Error::GraphQl(error_messages(errs)));
+        }
+        let contexts = &data["node"]["statusCheckRollup"]["contexts"];
+        for name in failing_checks(&data["node"]["statusCheckRollup"]) {
+            if !failing.contains(&name) {
+                failing.push(name);
+            }
+        }
+        Ok(next_cursor(contexts).map(|after| ContextsCursor {
+            commit: at.commit.clone(),
+            after,
+        }))
+    }
+
+    /// Reads the rest of the commit lists of `cache`'s records with more
+    /// than 100 commits, and the rest of the checks on the heads of its open
+    /// records with more than 100, while the call has requests left. A
+    /// record that needs fetching is read in full by a later call, after its
+    /// fetch.
+    fn lists(&self, cache: &mut PrCache) -> Result<()> {
+        for rec in cache.records.values_mut().filter(|r| !r.needs_fetch()) {
+            while let Some(after) = rec.contribution.commits_cursor.clone() {
+                if self.low() {
+                    self.note_low();
+                    return Ok(());
+                }
+                if !self.slot() {
+                    return Ok(());
+                }
+                let vars = json!({ "id": rec.id, "after": after });
+                let v = self.gh.graphql_body(COMMITS_QUERY, vars)?;
+                self.update(|r| r.list_pages += 1);
+                let data = &v["data"];
+                self.note(data);
+                let commits = &data["node"]["commits"];
+                let errs = graphql_errors(&v);
+                // The pull request is gone: nothing more to read.
+                if !commits.is_object() && errs.iter().any(|e| e["type"] == "NOT_FOUND") {
+                    rec.contribution.commits_cursor = None;
+                    break;
+                }
+                if !errs.is_empty() {
+                    return Err(Error::GraphQl(error_messages(errs)));
+                }
+                let additions = rec.contribution.additions;
+                rec.contribution
+                    .commits
+                    .extend(parse_commits(commits, additions));
+                rec.contribution.commits_cursor = next_cursor(commits);
+            }
+            while let Some(at) = rec.checks.contexts_cursor.clone() {
+                if self.low() {
+                    self.note_low();
+                    return Ok(());
+                }
+                if !self.slot() {
+                    return Ok(());
+                }
+                rec.checks.contexts_cursor = self.contexts_page(&at, &mut rec.checks.failing)?;
+            }
+        }
+        Ok(())
     }
 
     /// Continues `repo`'s walk over merged pull requests, or over those
@@ -941,6 +1057,27 @@ fn run_pass(
         result?;
     }
 
+    let repos: Vec<&mut (String, PrCache)> = caches
+        .iter_mut()
+        .filter(|(_, c)| {
+            c.records.values().any(|r| {
+                !r.needs_fetch()
+                    && (r.contribution.commits_cursor.is_some()
+                        || r.checks.contexts_cursor.is_some())
+            })
+        })
+        .collect();
+    let result = stage(
+        Stage::Lists,
+        repos,
+        "commit and check lists",
+        &|_, cache| pass.lists(cache),
+    );
+    if let Some(result) = result {
+        end(Stage::Lists, caches);
+        result?;
+    }
+
     for (kind, closed) in [(Stage::MergedWalk, false), (Stage::ClosedWalk, true)] {
         let repos: Vec<&mut (String, PrCache)> = caches
             .iter_mut()
@@ -1060,6 +1197,25 @@ fn next_cursor(conn: &Value) -> Option<String> {
     conn["pageInfo"]["endCursor"].as_str().map(str::to_string)
 }
 
+/// Whether `fresh` read only the newest items of its timeline, fewer than
+/// were added since `kept` was read, and none of them is an item `kept`
+/// holds: the items between them were not read.
+fn misses_kept_items(kept: &PrRecord, fresh: &PrRecord) -> bool {
+    let kept_ids: BTreeSet<&str> = kept
+        .timeline
+        .iter()
+        .map(|t| t.id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let read = fresh.timeline.len() as u64;
+    read + kept.timeline_total < fresh.timeline_total
+        && !kept_ids.is_empty()
+        && !fresh
+            .timeline
+            .iter()
+            .any(|t| kept_ids.contains(t.id.as_str()))
+}
+
 fn parse_files(conn: &Value) -> Vec<FileLines> {
     conn["nodes"]
         .as_array()
@@ -1153,28 +1309,7 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
     let head = &v["head"]["nodes"][0]["commit"];
     let rollup = &head["statusCheckRollup"];
     let additions = v["additions"].as_u64().unwrap_or(0);
-    let commits: Vec<PrCommit> = v["commits"]["nodes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|n| {
-            let c = &n["commit"];
-            let headline = string(&c["messageHeadline"]);
-            let adds = c["additions"].as_u64().unwrap_or(0);
-            PrCommit {
-                oid: string(&c["oid"]),
-                authored_at: time(&c["authoredDate"]),
-                committed_at: time(&c["committedDate"]),
-                additions: adds,
-                deletions: c["deletions"].as_u64().unwrap_or(0),
-                author: login(&c["author"]["user"]),
-                author_email: string(&c["author"]["email"]).to_lowercase(),
-                is_merge: is_merge_commit(&headline, adds, additions),
-                headline,
-                co_authors: parse_co_authors(c["message"].as_str().unwrap_or_default()),
-            }
-        })
-        .collect();
+    let commits = parse_commits(&v["commits"], additions);
     let mc = &v["mergeCommit"];
     let merge_commit = mc["oid"].as_str().map(|oid| MergeCommit {
         oid: oid.to_string(),
@@ -1205,6 +1340,7 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
         merged_by,
         head_ref_name: string(&v["headRefName"]),
         head_ref_oid: string(&v["headRefOid"]),
+        base_ref_name: string(&v["baseRefName"]),
         is_cross_repository: v["isCrossRepository"].as_bool().unwrap_or(false),
         maintainer_can_modify: v["maintainerCanModify"].as_bool().unwrap_or(false),
         body: string(&v["body"]),
@@ -1238,8 +1374,10 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
             files: parse_files(&v["files"]),
             files_total: count(&v["files"]),
             files_cursor: next_cursor(&v["files"]),
+            files_head: string(&v["headRefOid"]),
             commits,
             commits_total: count(&v["commits"]),
+            commits_cursor: next_cursor(&v["commits"]),
             merge_commit,
             merger: resolved,
         },
@@ -1249,8 +1387,47 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
     rec.checks.merge_state = string(&v["mergeStateStatus"]);
     rec.checks.rollup = rollup["state"].as_str().map(str::to_string);
     rec.checks.failing = failing_checks(rollup);
+    if rec.state == PrState::Open {
+        rec.checks.contexts_cursor = contexts_cursor(head);
+    }
     rec.checks.suites = parse_suites(&head["checkSuites"]);
     Some(rec)
+}
+
+/// The commits of a `commits` connection of a pull request with
+/// `additions` lines added.
+fn parse_commits(conn: &Value, additions: u64) -> Vec<PrCommit> {
+    conn["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|n| {
+            let c = &n["commit"];
+            let headline = string(&c["messageHeadline"]);
+            let adds = c["additions"].as_u64().unwrap_or(0);
+            PrCommit {
+                oid: string(&c["oid"]),
+                authored_at: time(&c["authoredDate"]),
+                committed_at: time(&c["committedDate"]),
+                additions: adds,
+                deletions: c["deletions"].as_u64().unwrap_or(0),
+                author: login(&c["author"]["user"]),
+                author_email: string(&c["author"]["email"]).to_lowercase(),
+                is_merge: is_merge_commit(&headline, adds, additions),
+                headline,
+                co_authors: parse_co_authors(c["message"].as_str().unwrap_or_default()),
+            }
+        })
+        .collect()
+}
+
+/// Where the rest of `commit`'s checks start, when they fill more than the
+/// page read.
+fn contexts_cursor(commit: &Value) -> Option<ContextsCursor> {
+    Some(ContextsCursor {
+        commit: commit["id"].as_str()?.to_string(),
+        after: next_cursor(&commit["statusCheckRollup"]["contexts"])?,
+    })
 }
 
 /// The timeline items of a `timelineItems` connection, oldest first.
@@ -1363,7 +1540,7 @@ query($ids: [ID!]!, $tl: Int!) {
 const SWEEP_QUERY: &str = r#"
 query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
-    defaultBranchRef { target { ... on Commit { oid statusCheckRollup { state contexts(first: 30) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
+    defaultBranchRef { target { ... on Commit { id oid statusCheckRollup { state contexts(first: 100) { pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
     pullRequests(states: OPEN, first: 100, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
       totalCount pageInfo { hasNextPage endCursor }
       nodes { id number title author { __typename login } updatedAt isDraft headRefOid mergeable mergeStateStatus maintainerCanModify
@@ -1384,6 +1561,24 @@ query($id: ID!, $after: String) {
 }
 "#;
 
+/// The next page of one pull request's commits.
+const COMMITS_QUERY: &str = r#"
+query($id: ID!, $after: String) {
+  node(id: $id) { ... on PullRequest { commits(first: 100, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { commit { oid authoredDate committedDate additions deletions
+    messageHeadline message author { email name user { login } } } } } } }
+  rateLimit { cost remaining }
+}
+"#;
+
+/// The next page of the checks on one commit.
+const CONTEXTS_QUERY: &str = r#"
+query($id: ID!, $after: String) {
+  node(id: $id) { ... on Commit { statusCheckRollup { state contexts(first: 100, after: $after) { pageInfo { hasNextPage endCursor }
+    nodes { __typename ... on CheckRun { name conclusion status } ... on StatusContext { context state } } } } } }
+  rateLimit { cost remaining }
+}
+"#;
+
 /// The fields of one pull request that the records keep: its own fields,
 /// the head commit's checks, the changed files and commits (with their
 /// messages, for co-author trailers), and the newest `$tl` timeline items.
@@ -1391,16 +1586,16 @@ pub const PR_FRAGMENT: &str = r#"
 fragment R on PullRequest {
   id number url title state isDraft createdAt updatedAt closedAt mergedAt
   author { __typename login } authorAssociation mergedBy { login }
-  maintainerCanModify isCrossRepository headRefName headRefOid
+  maintainerCanModify isCrossRepository headRefName headRefOid baseRefName
   mergeable mergeStateStatus body additions deletions changedFiles
   mergeCommit { oid messageHeadline parents(first: 2) { totalCount } committer { name user { login } } }
   assignees(first: 3) { nodes { login } }
   closingIssuesReferences(first: 5) { nodes { number title repository { nameWithOwner } } }
   files(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { path additions deletions } }
-  commits(first: 100) { totalCount nodes { commit { oid authoredDate committedDate additions deletions
+  commits(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { commit { oid authoredDate committedDate additions deletions
     messageHeadline message author { email name user { login } } } } }
-  head: commits(last: 1) { nodes { commit { oid
-    statusCheckRollup { state contexts(first: 20) { nodes { __typename ... on CheckRun { name conclusion status } ... on StatusContext { context state } } } }
+  head: commits(last: 1) { nodes { commit { id oid
+    statusCheckRollup { state contexts(first: 100) { pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name conclusion status } ... on StatusContext { context state } } } }
     checkSuites(first: 8) { nodes { status conclusion createdAt app { slug } } } } } }
   timelineItems(last: $tl, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW, HEAD_REF_FORCE_PUSHED_EVENT,
       CONVERT_TO_DRAFT_EVENT, READY_FOR_REVIEW_EVENT, CROSS_REFERENCED_EVENT, ASSIGNED_EVENT, CLOSED_EVENT, MERGED_EVENT, REOPENED_EVENT]) {
@@ -1802,6 +1997,86 @@ mod tests {
         assert!(!cache.records[&4].needs_fetch());
     }
 
+    #[test]
+    fn a_changed_list_page_that_misses_the_kept_items_is_read_again() {
+        let now = t("2026-10-17T12:00:00Z");
+        let mut cache = PrCache {
+            high_water: Some(t("2026-10-17T10:00:00Z")),
+            ..Default::default()
+        };
+        let start = t("2026-10-16T00:00:00Z");
+        let items = |number: u64, from: usize, to: usize| -> Vec<Value> {
+            (from..to)
+                .map(|i| {
+                    let at = (start + chrono::Duration::minutes(i as i64)).to_rfc3339();
+                    json!({"__typename": "IssueComment", "id": format!("c{number}-{i}"), "createdAt": at,
+                           "author": {"__typename": "User", "login": "ann"}, "authorAssociation": "NONE", "body": "hi"})
+                })
+                .collect()
+        };
+        let read = |number: u64, total: usize, updated: &str| {
+            let mut n = node(number, "OPEN", updated);
+            n["timelineItems"] = json!({"totalCount": total, "nodes": items(number, total.saturating_sub(50), total)});
+            parse_pr(&n).unwrap()
+        };
+        // #4 and #6 were read with their first 10 items.
+        cache.put(read(4, 10, "2026-10-17T09:00:00Z"), now);
+        cache.put(read(6, 10, "2026-10-17T09:00:00Z"), now);
+        // Since then #4 got 70 more items and #6 got 50; the changed list
+        // reads the newest 50 of each.
+        let (api, _requests) = stub(vec![page(
+            vec![
+                {
+                    let mut n = node(4, "OPEN", "2026-10-17T11:30:00Z");
+                    n["timelineItems"] = json!({"totalCount": 80, "nodes": items(4, 30, 80)});
+                    n
+                },
+                {
+                    let mut n = node(6, "OPEN", "2026-10-17T11:20:00Z");
+                    n["timelineItems"] = json!({"totalCount": 60, "nodes": items(6, 10, 60)});
+                    n
+                },
+            ],
+            None,
+            4000,
+        )]);
+        let gh = GitHub::with_api("t", api).unwrap();
+        pass(&gh, now)
+            .changed("o/r", &mut cache, Some(&seen_at("2026-10-17T11:30:00Z")))
+            .unwrap();
+        let four = &cache.records[&4];
+        assert!(four.needs_fetch(), "items 10 to 29 were missed");
+        assert_eq!(
+            four.timeline.first().map(|i| i.id.as_str()),
+            Some("c4-30"),
+            "the items before the gap go"
+        );
+        let six = &cache.records[&6];
+        assert!(
+            !six.needs_fetch(),
+            "the page starts right after the kept items"
+        );
+        assert_eq!(six.timeline.len(), 60);
+        // Before the backfill reads #4, the changed list reads its newest 50
+        // again, which now overlap the items it holds: it stays marked.
+        let (api, _requests) = stub(vec![page(
+            vec![{
+                let mut n = node(4, "OPEN", "2026-10-17T11:40:00Z");
+                n["timelineItems"] = json!({"totalCount": 85, "nodes": items(4, 35, 85)});
+                n
+            }],
+            None,
+            4000,
+        )]);
+        let gh = GitHub::with_api("t", api).unwrap();
+        pass(&gh, now)
+            .changed("o/r", &mut cache, Some(&seen_at("2026-10-17T11:40:00Z")))
+            .unwrap();
+        let four = &cache.records[&4];
+        assert_eq!(four.timeline.len(), 55);
+        assert!(four.needs_fetch(), "still waiting for the backfill");
+    }
+
     fn sweep_page(open: Vec<Value>) -> String {
         ok_json(
             &json!({"data": {
@@ -2046,6 +2321,334 @@ mod tests {
         caches[0].1.put(again, now);
         assert_eq!(caches[0].1.records[&4].contribution.files.len(), 3);
         assert_eq!(caches[0].1.records[&4].contribution.files_cursor, None);
+    }
+
+    /// The number after `key` in `request`: a `first:` limit, or where one
+    /// of these tests' cursors points.
+    fn number_after(request: &str, key: &str) -> usize {
+        let at = request.find(key).map_or(request.len(), |i| i + key.len());
+        let digits: String = request[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().unwrap_or(0)
+    }
+
+    /// A GraphQL answer with `data`.
+    fn answer(mut data: Value) -> String {
+        data["rateLimit"] = json!({"cost": 1, "remaining": 4000});
+        ok_json(&json!({ "data": data }).to_string())
+    }
+
+    /// Checks `from..` of a commit with `total`, as many as `first` asks
+    /// for. Those in `failing` fail; the others pass.
+    fn contexts(total: usize, failing: &[(usize, &str)], from: usize, first: usize) -> Value {
+        let end = total.min(from + first);
+        let nodes: Vec<Value> = (from..end)
+            .map(|i| {
+                let (name, conclusion) = match failing.iter().find(|(at, _)| *at == i) {
+                    Some((_, name)) => (name.to_string(), "FAILURE"),
+                    None => (format!("check-{i}"), "SUCCESS"),
+                };
+                json!({"__typename": "CheckRun", "name": name, "conclusion": conclusion, "status": "COMPLETED"})
+            })
+            .collect();
+        json!({"pageInfo": {"hasNextPage": end < total, "endCursor": format!("x{end}")}, "nodes": nodes})
+    }
+
+    /// Commits `from..` of a pull request with `total`, as many as `first`
+    /// asks for, by ann, one a minute from 2026-10-16 00:00.
+    fn commits(total: usize, from: usize, first: usize) -> Value {
+        let end = total.min(from + first);
+        let start = t("2026-10-16T00:00:00Z");
+        let nodes: Vec<Value> = (from..end)
+            .map(|i| {
+                let at = (start + chrono::Duration::minutes(i as i64)).to_rfc3339();
+                json!({"commit": {"oid": format!("k{i}"), "authoredDate": at, "committedDate": at,
+                    "additions": 1, "deletions": 0, "messageHeadline": format!("Step {i}"), "message": format!("Step {i}"),
+                    "author": {"email": "ann@example.com", "name": "Ann", "user": {"login": "ann"}}}})
+            })
+            .collect();
+        json!({"totalCount": total, "pageInfo": {"hasNextPage": end < total, "endCursor": format!("k{end}")}, "nodes": nodes})
+    }
+
+    /// #9, open, with 130 commits and 130 checks on its head, of which
+    /// `flaky` (the 4th) and `e2e` (the 121st) fail; the first page of each
+    /// holds as many as `request` asks for.
+    fn long_pr(request: &str) -> Value {
+        let mut n = node(9, "OPEN", "2026-10-17T11:30:00Z");
+        n["headRefOid"] = json!("k129");
+        n["commits"] = commits(130, 0, number_after(request, "commits(first: "));
+        let first = number_after(request, "contexts(first: ");
+        let checks = contexts(130, &LONG_FAILING, 0, first);
+        n["head"] = json!({"nodes": [{"commit": {"id": "C_h9", "oid": "k129",
+            "statusCheckRollup": {"state": "FAILURE", "contexts": checks}}}]});
+        n
+    }
+
+    const LONG_FAILING: [(usize, &str); 2] = [(3, "flaky"), (120, "e2e")];
+
+    #[test]
+    fn commit_and_check_lists_past_the_first_page_are_read() {
+        let dir = std::env::temp_dir().join(format!("craft-prs-lists-{}", std::process::id()));
+        let now = t("2026-10-17T12:00:00Z");
+        let repos = vec!["o/r".to_string()];
+        let mut seen = HashMap::new();
+        seen.insert("o/r".to_string(), Some(seen_at("2026-10-17T11:30:00Z")));
+        backlog(0, now).save(&dir, "o/r").unwrap();
+        let api = crate::tests::routed_stub(|request| {
+            let data = if request.contains("commits(first: 100, after:") {
+                let from = number_after(request, "\"after\":\"k");
+                json!({"node": {"commits": commits(130, from, 100)}})
+            } else if request.contains("contexts(first: 100, after:") {
+                let from = number_after(request, "\"after\":\"x");
+                json!({"node": {"statusCheckRollup": {"contexts": contexts(130, &LONG_FAILING, from, 100)}}})
+            } else {
+                json!({"repository": {"pullRequests": {"pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "nodes": [long_pr(request)]}}})
+            };
+            Some(answer(data))
+        });
+        let gh = GitHub::with_api("t", api).unwrap();
+        let (report, _) = gh.update_prs(&input(&repos, &seen, &dir, now));
+        assert_eq!(report.errors, Vec::<String>::new());
+        let cache = PrCache::load(&dir, "o/r");
+        let rec = &cache.records[&9];
+        assert_eq!(rec.checks.failing, ["flaky", "e2e"]);
+        let c = &rec.contribution;
+        assert_eq!((c.commits.len(), c.commits_total), (130, 130));
+        assert_eq!(
+            c.commits.last().map(|k| k.oid.as_str()),
+            Some("k129"),
+            "the newest push"
+        );
+        assert_eq!(
+            gh.graphql_sent(),
+            3,
+            "the changed list, a commit page and a check page"
+        );
+        assert_eq!(report.list_pages, 2);
+        assert_eq!(c.commits_cursor, None);
+        assert_eq!(rec.checks.contexts_cursor, None);
+        // A later fetch of the same head keeps the commit pages read, and
+        // its check list is read again.
+        let first_pages = long_pr("commits(first: 100) contexts(first: 100)");
+        let mut cache = cache.clone();
+        let again = parse_pr(&first_pages).unwrap();
+        assert_eq!(
+            again.checks.contexts_cursor,
+            Some(ContextsCursor {
+                commit: "C_h9".into(),
+                after: "x100".into()
+            })
+        );
+        cache.put(again, now);
+        let rec = &cache.records[&9];
+        assert_eq!(rec.contribution.commits.len(), 130);
+        assert_eq!(rec.contribution.commits_cursor, None);
+        assert_eq!(rec.checks.failing, ["flaky"]);
+        assert!(rec.checks.contexts_cursor.is_some());
+        // After a force-push to a new head with as many commits, which the
+        // sweep sees first, the pages are read again.
+        let light = Light {
+            id: "PR_9".into(),
+            number: 9,
+            head_ref_oid: "k999".into(),
+            ..Default::default()
+        };
+        cache.records.get_mut(&9).unwrap().apply_light(&light, now);
+        let mut pushed = first_pages;
+        pushed["headRefOid"] = json!("k999");
+        cache.put(parse_pr(&pushed).unwrap(), now);
+        let c = &cache.records[&9].contribution;
+        assert_eq!(c.commits.len(), 100);
+        assert_eq!(c.commits_cursor.as_deref(), Some("k100"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_refresh_keeps_commit_pages_read_part_way_while_the_head_stays() {
+        let now = t("2026-10-17T12:00:00Z");
+        let fetch = |head: &str| {
+            let mut n = node(9, "OPEN", "2026-10-17T11:30:00Z");
+            n["headRefOid"] = json!(head);
+            n["commits"] = commits(250, 0, 100);
+            parse_pr(&n).unwrap()
+        };
+        let mut cache = PrCache::default();
+        cache.put(fetch("k249"), now);
+        // A call read one more page before the request cap ran out.
+        let rec = cache.records.get_mut(&9).unwrap();
+        let page = parse_commits(&commits(250, 100, 100), 0);
+        rec.contribution.commits.extend(page);
+        rec.contribution.commits_cursor = Some("k200".into());
+        // A comment brings a fetch of the same head: the pages stay.
+        cache.put(fetch("k249"), now);
+        let c = &cache.records[&9].contribution;
+        assert_eq!(
+            (c.commits.len(), c.commits_cursor.as_deref()),
+            (200, Some("k200"))
+        );
+        // A fetch of a new head starts over, whether the changed list or
+        // the sweep sees the head first.
+        let mut direct = cache.clone();
+        direct.put(fetch("k999"), now);
+        let c = &direct.records[&9].contribution;
+        assert_eq!(
+            (c.commits.len(), c.commits_cursor.as_deref()),
+            (100, Some("k100"))
+        );
+        let light = Light {
+            id: "PR_9".into(),
+            number: 9,
+            head_ref_oid: "k999".into(),
+            ..Default::default()
+        };
+        cache.records.get_mut(&9).unwrap().apply_light(&light, now);
+        cache.put(fetch("k999"), now);
+        let c = &cache.records[&9].contribution;
+        assert_eq!(
+            (c.commits.len(), c.commits_cursor.as_deref()),
+            (100, Some("k100"))
+        );
+    }
+
+    #[test]
+    fn pages_read_against_another_base_or_another_first_page_are_not_kept() {
+        let now = t("2026-10-17T12:00:00Z");
+        let fetch = |base: &str, total: usize| {
+            let mut n = node(9, "OPEN", "2026-10-17T11:30:00Z");
+            n["headRefOid"] = json!(format!("k{}", total - 1));
+            n["baseRefName"] = json!(base);
+            n["commits"] = commits(total, 0, 100);
+            parse_pr(&n).unwrap()
+        };
+        let read_on = |cache: &mut PrCache| {
+            let rec = cache.records.get_mut(&9).unwrap();
+            let page = parse_commits(&commits(250, 100, 100), 0);
+            rec.contribution.commits.extend(page);
+            rec.contribution.commits_cursor = Some("k200".into());
+        };
+        let pages = |cache: &PrCache| {
+            let c = &cache.records[&9].contribution;
+            (c.commits.len(), c.commits_cursor.clone())
+        };
+        let first_page = (100, Some("k100".to_string()));
+        // Pages read part way, then the base branch changes.
+        let mut cache = PrCache::default();
+        cache.put(fetch("main", 250), now);
+        read_on(&mut cache);
+        cache.put(fetch("main", 250), now);
+        assert_eq!(pages(&cache), (200, Some("k200".into())), "the same base");
+        cache.put(fetch("dev", 250), now);
+        assert_eq!(pages(&cache), first_page, "a new base");
+        // A whole list that ends at the head, then a base change.
+        let mut whole = PrCache::default();
+        whole.put(fetch("main", 150), now);
+        let rec = whole.records.get_mut(&9).unwrap();
+        rec.contribution
+            .commits
+            .extend(parse_commits(&commits(150, 100, 100), 0));
+        rec.contribution.commits_cursor = None;
+        whole.put(fetch("main", 150), now);
+        assert_eq!(pages(&whole), (150, None), "the same base");
+        whole.put(fetch("dev", 150), now);
+        assert_eq!(pages(&whole), first_page, "a new base");
+        // The same base and head, but a first page that starts differently.
+        let mut whole2 = whole.clone();
+        let rec = whole2.records.get_mut(&9).unwrap();
+        rec.contribution
+            .commits
+            .extend(parse_commits(&commits(150, 100, 100), 0));
+        rec.contribution.commits_cursor = None;
+        let mut moved = fetch("dev", 150);
+        moved.contribution.commits[0].oid = "j0".into();
+        whole2.put(moved, now);
+        let c = &whole2.records[&9].contribution;
+        assert_eq!(
+            (c.commits.len(), c.commits[0].oid.as_str()),
+            (100, "j0"),
+            "the new first page"
+        );
+        // File pages read against one base are not kept for another.
+        let with_files = |base: &str| {
+            let mut r = fetch(base, 250);
+            r.contribution.files_total = 2;
+            r.contribution.files = vec![FileLines {
+                path: "a".into(),
+                ..Default::default()
+            }];
+            r
+        };
+        let mut files = PrCache::default();
+        files.put(with_files("main"), now);
+        let second = FileLines {
+            path: "b".into(),
+            ..Default::default()
+        };
+        files
+            .records
+            .get_mut(&9)
+            .unwrap()
+            .contribution
+            .files
+            .push(second);
+        files.put(with_files("main"), now);
+        assert_eq!(files.records[&9].contribution.files.len(), 2);
+        files.put(with_files("dev"), now);
+        assert_eq!(files.records[&9].contribution.files.len(), 1);
+    }
+
+    /// A sweep answer with 130 checks on main, of which `flaky` (the 111th)
+    /// fails, as many in the first page as `request` asks for, and no open
+    /// pull request.
+    fn long_main_sweep(request: &str) -> Value {
+        let first = number_after(request, "contexts(first: ");
+        json!({"repository": {
+            "defaultBranchRef": {"target": {"id": "C_main", "oid": "main1", "statusCheckRollup": {"state": "FAILURE",
+                "contexts": contexts(130, &MAIN_FAILING, 0, first)}}},
+            "pullRequests": {"totalCount": 0, "pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []}},
+            "viewer": {"login": "ann"}})
+    }
+
+    const MAIN_FAILING: [(usize, &str); 1] = [(110, "flaky")];
+
+    #[test]
+    fn the_checks_on_main_are_read_past_the_first_page() {
+        let now = t("2026-10-17T12:00:00Z");
+        let api = crate::tests::routed_stub(|request| {
+            let data = if request.contains("contexts(first: 100, after:") {
+                let from = number_after(request, "\"after\":\"x");
+                json!({"node": {"statusCheckRollup": {"contexts": contexts(130, &MAIN_FAILING, from, 100)}}})
+            } else {
+                long_main_sweep(request)
+            };
+            Some(answer(data))
+        });
+        let gh = GitHub::with_api("t", api).unwrap();
+        let mut cache = PrCache::default();
+        assert!(pass(&gh, now).sweep("o/r", &mut cache).unwrap());
+        let main = cache.main_checks.unwrap();
+        assert_eq!(main.failing, ["flaky"]);
+        assert_eq!(gh.graphql_sent(), 2, "the sweep and a check page");
+
+        // Below the floor no check page is asked for, and the checks read
+        // before stay.
+        let api = crate::tests::routed_stub(|request| {
+            let mut data = long_main_sweep(request);
+            data["rateLimit"] = json!({"cost": 1, "remaining": 1_000});
+            Some(ok_json(&json!({ "data": data }).to_string()))
+        });
+        let gh = GitHub::with_api("t", api).unwrap();
+        let mut cache = PrCache {
+            main_checks: Some(MainChecks::default()),
+            ..Default::default()
+        };
+        let p = pass(&gh, now);
+        assert!(!p.sweep("o/r", &mut cache).unwrap());
+        assert!(p.report().low_budget);
+        assert_eq!(cache.main_checks, Some(MainChecks::default()));
+        assert_eq!(gh.graphql_sent(), 1);
     }
 
     #[test]
