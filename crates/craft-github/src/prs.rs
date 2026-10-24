@@ -1304,6 +1304,7 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
         merged_by,
         head_ref_name: string(&v["headRefName"]),
         head_ref_oid: string(&v["headRefOid"]),
+        base_ref_name: string(&v["baseRefName"]),
         is_cross_repository: v["isCrossRepository"].as_bool().unwrap_or(false),
         maintainer_can_modify: v["maintainerCanModify"].as_bool().unwrap_or(false),
         body: string(&v["body"]),
@@ -1337,6 +1338,7 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
             files: parse_files(&v["files"]),
             files_total: count(&v["files"]),
             files_cursor: next_cursor(&v["files"]),
+            files_head: string(&v["headRefOid"]),
             commits,
             commits_total: count(&v["commits"]),
             commits_cursor: next_cursor(&v["commits"]),
@@ -1548,7 +1550,7 @@ pub const PR_FRAGMENT: &str = r#"
 fragment R on PullRequest {
   id number url title state isDraft createdAt updatedAt closedAt mergedAt
   author { __typename login } authorAssociation mergedBy { login }
-  maintainerCanModify isCrossRepository headRefName headRefOid
+  maintainerCanModify isCrossRepository headRefName headRefOid baseRefName
   mergeable mergeStateStatus body additions deletions changedFiles
   mergeCommit { oid messageHeadline parents(first: 2) { totalCount } committer { name user { login } } }
   assignees(first: 3) { nodes { login } }
@@ -2393,6 +2395,92 @@ mod tests {
             (c.commits.len(), c.commits_cursor.as_deref()),
             (100, Some("k100"))
         );
+    }
+
+    #[test]
+    fn pages_read_against_another_base_or_another_first_page_are_not_kept() {
+        let now = t("2026-10-17T12:00:00Z");
+        let fetch = |base: &str, total: usize| {
+            let mut n = node(9, "OPEN", "2026-10-17T11:30:00Z");
+            n["headRefOid"] = json!(format!("k{}", total - 1));
+            n["baseRefName"] = json!(base);
+            n["commits"] = commits(total, 0, 100);
+            parse_pr(&n).unwrap()
+        };
+        let read_on = |cache: &mut PrCache| {
+            let rec = cache.records.get_mut(&9).unwrap();
+            let page = parse_commits(&commits(250, 100, 100), 0);
+            rec.contribution.commits.extend(page);
+            rec.contribution.commits_cursor = Some("k200".into());
+        };
+        let pages = |cache: &PrCache| {
+            let c = &cache.records[&9].contribution;
+            (c.commits.len(), c.commits_cursor.clone())
+        };
+        let first_page = (100, Some("k100".to_string()));
+        // Pages read part way, then the base branch changes.
+        let mut cache = PrCache::default();
+        cache.put(fetch("main", 250), now);
+        read_on(&mut cache);
+        cache.put(fetch("main", 250), now);
+        assert_eq!(pages(&cache), (200, Some("k200".into())), "the same base");
+        cache.put(fetch("dev", 250), now);
+        assert_eq!(pages(&cache), first_page, "a new base");
+        // A whole list that ends at the head, then a base change.
+        let mut whole = PrCache::default();
+        whole.put(fetch("main", 150), now);
+        let rec = whole.records.get_mut(&9).unwrap();
+        rec.contribution
+            .commits
+            .extend(parse_commits(&commits(150, 100, 100), 0));
+        rec.contribution.commits_cursor = None;
+        whole.put(fetch("main", 150), now);
+        assert_eq!(pages(&whole), (150, None), "the same base");
+        whole.put(fetch("dev", 150), now);
+        assert_eq!(pages(&whole), first_page, "a new base");
+        // The same base and head, but a first page that starts differently.
+        let mut whole2 = whole.clone();
+        let rec = whole2.records.get_mut(&9).unwrap();
+        rec.contribution
+            .commits
+            .extend(parse_commits(&commits(150, 100, 100), 0));
+        rec.contribution.commits_cursor = None;
+        let mut moved = fetch("dev", 150);
+        moved.contribution.commits[0].oid = "j0".into();
+        whole2.put(moved, now);
+        let c = &whole2.records[&9].contribution;
+        assert_eq!(
+            (c.commits.len(), c.commits[0].oid.as_str()),
+            (100, "j0"),
+            "the new first page"
+        );
+        // File pages read against one base are not kept for another.
+        let with_files = |base: &str| {
+            let mut r = fetch(base, 250);
+            r.contribution.files_total = 2;
+            r.contribution.files = vec![FileLines {
+                path: "a".into(),
+                ..Default::default()
+            }];
+            r
+        };
+        let mut files = PrCache::default();
+        files.put(with_files("main"), now);
+        let second = FileLines {
+            path: "b".into(),
+            ..Default::default()
+        };
+        files
+            .records
+            .get_mut(&9)
+            .unwrap()
+            .contribution
+            .files
+            .push(second);
+        files.put(with_files("main"), now);
+        assert_eq!(files.records[&9].contribution.files.len(), 2);
+        files.put(with_files("dev"), now);
+        assert_eq!(files.records[&9].contribution.files.len(), 1);
     }
 
     /// A sweep answer with 130 checks on main, of which `flaky` (the 111th)
