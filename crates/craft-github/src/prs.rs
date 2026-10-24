@@ -17,13 +17,17 @@
 //!   closed without merging, newest update first, each continued from where
 //!   the previous call stopped.
 //!
+//! Commit lists and the checks on a head are read in pages of 100: the
+//! records the backfill leaves fetched get the rest of theirs after it, and
+//! the sweep reads all of the checks on the default branch's head.
+//!
 //! The requests go one at a time, through the client given, which in the
 //! app sends them as background requests (see [`crate::gate`]). Once GitHub
 //! reports fewer points left than the floor, only the changed list runs.
 //!
-//! The backfill, the walks and the file lists send at most
-//! [`PrInput::max_requests`] requests in one call ([`RUN_REQUESTS`] in the
-//! app), so a first load is spread over many calls; the changed lists and
+//! The backfill, the commit and check lists, the walks and the file lists
+//! send at most [`PrInput::max_requests`] requests in one call
+//! ([`RUN_REQUESTS`] in the app), so a first load is spread over many calls; the changed lists and
 //! the sweep keep their own page limits ([`MAX_CHANGED_PAGES`],
 //! [`MAX_SWEEP_PAGES`]), so they finish whatever the cap leaves. The changed
 //! lists of the repositories whose records were checked longest ago go
@@ -46,8 +50,8 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use craft_core::people::record::{
-    Closer, Contribution, CrossSource, FileLines, Gap, Light, MainChecks, MergeCommit, PrCache,
-    PrCommit, PrRecord, PrState, Suite, TimelineItem,
+    Closer, ContextsCursor, Contribution, CrossSource, FileLines, Gap, Light, MainChecks,
+    MergeCommit, PrCache, PrCommit, PrRecord, PrState, Suite, TimelineItem,
 };
 use craft_core::people::roster::Fetched;
 use craft_core::people::{is_merge_commit, merger, parse_co_authors, parse_reverts};
@@ -85,6 +89,7 @@ pub enum Stage {
     Changed,
     Sweep,
     Backfill,
+    Lists,
     MergedWalk,
     ClosedWalk,
     FileLists,
@@ -96,6 +101,7 @@ impl Stage {
             Stage::Changed => "changed lists",
             Stage::Sweep => "sweep",
             Stage::Backfill => "backfill",
+            Stage::Lists => "commit and check lists",
             Stage::MergedWalk => "merged walk",
             Stage::ClosedWalk => "closed walk",
             Stage::FileLists => "file lists",
@@ -134,6 +140,8 @@ pub struct PrReport {
     pub closed: usize,
     /// File-list pages read.
     pub file_pages: usize,
+    /// Commit-list and check-list pages read after the first.
+    pub list_pages: usize,
     /// Requests sent in all, and how many times a smaller query was asked
     /// for because GitHub could not finish one.
     pub requests: usize,
@@ -570,7 +578,30 @@ impl<'a> Pass<'a> {
             let v = self.repo_query(SWEEP_QUERY, repo, vars)?;
             let r = &v["repository"];
             if page == 0 {
-                cache.note_main(parse_main(&r["defaultBranchRef"]["target"]), self.clock());
+                // The checks on main are kept once every page is read; below
+                // the floor the checks read before stay.
+                let mut target = r["defaultBranchRef"]["target"].clone();
+                let mut next = contexts_cursor(&target);
+                while let Some(at) = next.take() {
+                    if self.low() {
+                        self.note_low();
+                        return Ok(false);
+                    }
+                    self.count();
+                    let (rollup, more) = self.contexts_page(&at)?;
+                    let page = &rollup["contexts"];
+                    let contexts = &mut target["statusCheckRollup"]["contexts"];
+                    if let (Some(nodes), Some(read)) =
+                        (contexts["nodes"].as_array_mut(), page["nodes"].as_array())
+                    {
+                        nodes.extend(read.iter().cloned());
+                    }
+                    if page["pageInfo"].is_object() {
+                        contexts["pageInfo"] = page["pageInfo"].clone();
+                    }
+                    next = more;
+                }
+                cache.note_main(parse_main(&target), self.clock());
                 if let Some(me) = login(&v["viewer"]) {
                     self.update(|r| r.viewer = Some(me));
                 }
@@ -700,6 +731,82 @@ impl<'a> Pass<'a> {
             }
             Ok(vec![])
         })
+    }
+
+    /// Reads one page of the checks on a commit, from `at`: the page's
+    /// `statusCheckRollup`, and where the next page starts. The caller has
+    /// counted the request.
+    fn contexts_page(&self, at: &ContextsCursor) -> Result<(Value, Option<ContextsCursor>)> {
+        let vars = json!({ "id": at.commit, "after": at.after });
+        let v = self.gh.graphql_body(CONTEXTS_QUERY, vars)?;
+        self.update(|r| r.list_pages += 1);
+        let data = &v["data"];
+        self.note(data);
+        let errs = graphql_errors(&v);
+        if !errs.is_empty() {
+            return Err(Error::GraphQl(error_messages(errs)));
+        }
+        let rollup = data["node"]["statusCheckRollup"].clone();
+        let next = next_cursor(&rollup["contexts"]).map(|after| ContextsCursor {
+            commit: at.commit.clone(),
+            after,
+        });
+        Ok((rollup, next))
+    }
+
+    /// Reads the rest of the commit lists of `cache`'s records with more
+    /// than 100 commits, and the rest of the checks on the heads of its open
+    /// records with more than 100, while the call has requests left. A
+    /// record that needs fetching is read in full by a later call, after its
+    /// fetch.
+    fn lists(&self, cache: &mut PrCache) -> Result<()> {
+        for rec in cache.records.values_mut().filter(|r| !r.needs_fetch()) {
+            while let Some(after) = rec.contribution.commits_cursor.clone() {
+                if self.low() {
+                    self.note_low();
+                    return Ok(());
+                }
+                if !self.slot() {
+                    return Ok(());
+                }
+                let vars = json!({ "id": rec.id, "after": after });
+                let v = self.gh.graphql_body(COMMITS_QUERY, vars)?;
+                self.update(|r| r.list_pages += 1);
+                let data = &v["data"];
+                self.note(data);
+                let commits = &data["node"]["commits"];
+                let errs = graphql_errors(&v);
+                // The pull request is gone: nothing more to read.
+                if !commits.is_object() && errs.iter().any(|e| e["type"] == "NOT_FOUND") {
+                    rec.contribution.commits_cursor = None;
+                    break;
+                }
+                if !errs.is_empty() {
+                    return Err(Error::GraphQl(error_messages(errs)));
+                }
+                let additions = rec.contribution.additions;
+                rec.contribution
+                    .commits
+                    .extend(parse_commits(commits, additions));
+                rec.contribution.commits_cursor = next_cursor(commits);
+            }
+            while let Some(at) = rec.checks.contexts_cursor.clone() {
+                if self.low() {
+                    self.note_low();
+                    return Ok(());
+                }
+                if !self.slot() {
+                    return Ok(());
+                }
+                let (rollup, next) = self.contexts_page(&at)?;
+                add_names(&mut rec.checks.failing, failing_checks(&rollup));
+                if let Some(statuses) = rec.checks.failing_statuses.as_mut() {
+                    add_names(statuses, failing_statuses(&rollup));
+                }
+                rec.checks.contexts_cursor = next;
+            }
+        }
+        Ok(())
     }
 
     /// Continues `repo`'s walk over merged pull requests, or over those
@@ -950,6 +1057,27 @@ fn run_pass(
         result?;
     }
 
+    let repos: Vec<&mut (String, PrCache)> = caches
+        .iter_mut()
+        .filter(|(_, c)| {
+            c.records.values().any(|r| {
+                !r.needs_fetch()
+                    && (r.contribution.commits_cursor.is_some()
+                        || r.checks.contexts_cursor.is_some())
+            })
+        })
+        .collect();
+    let result = stage(
+        Stage::Lists,
+        repos,
+        "commit and check lists",
+        &|_, cache| pass.lists(cache),
+    );
+    if let Some(result) = result {
+        end(Stage::Lists, caches);
+        result?;
+    }
+
     for (kind, closed) in [(Stage::MergedWalk, false), (Stage::ClosedWalk, true)] {
         let repos: Vec<&mut (String, PrCache)> = caches
             .iter_mut()
@@ -1137,6 +1265,15 @@ fn checks_with(rollup: &Value, outcomes: &[&str], keep: impl Fn(&Value) -> bool)
     out
 }
 
+/// Adds the names in `names` that `into` lacks.
+fn add_names(into: &mut Vec<String>, names: Vec<String>) {
+    for name in names {
+        if !into.contains(&name) {
+            into.push(name);
+        }
+    }
+}
+
 /// The default branch's head commit and its checks, from the sweep.
 fn parse_main(target: &Value) -> Option<MainChecks> {
     let oid = target["oid"].as_str()?;
@@ -1145,7 +1282,7 @@ fn parse_main(target: &Value) -> Option<MainChecks> {
         oid: oid.to_string(),
         rollup: rollup["state"].as_str().map(str::to_string),
         failing: failing_checks(rollup),
-        // With more checks than one page holds, a failure under a passing
+        // With pages of checks left unread, a failure under a passing
         // check's name may be unread, so no check is kept as passing.
         passing: if rollup["contexts"]["pageInfo"]["hasNextPage"].as_bool() == Some(true) {
             Vec::new()
@@ -1191,29 +1328,7 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
     let head = &v["head"]["nodes"][0]["commit"];
     let rollup = &head["statusCheckRollup"];
     let additions = v["additions"].as_u64().unwrap_or(0);
-    let commits: Vec<PrCommit> = v["commits"]["nodes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|n| {
-            let c = &n["commit"];
-            let headline = string(&c["messageHeadline"]);
-            let adds = c["additions"].as_u64().unwrap_or(0);
-            PrCommit {
-                oid: string(&c["oid"]),
-                authored_at: time(&c["authoredDate"]),
-                committed_at: time(&c["committedDate"]),
-                additions: adds,
-                deletions: c["deletions"].as_u64().unwrap_or(0),
-                author: login(&c["author"]["user"]),
-                author_email: string(&c["author"]["email"]).to_lowercase(),
-                is_merge: is_merge_commit(&headline, adds, additions),
-                co_authors: parse_co_authors(c["message"].as_str().unwrap_or_default()),
-                reverts: parse_reverts(&headline, c["message"].as_str().unwrap_or_default()),
-                headline,
-            }
-        })
-        .collect();
+    let commits = parse_commits(&v["commits"], additions);
     let mc = &v["mergeCommit"];
     let merge_commit = mc["oid"].as_str().map(|oid| MergeCommit {
         oid: oid.to_string(),
@@ -1279,6 +1394,7 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
             files_cursor: next_cursor(&v["files"]),
             commits,
             commits_total: count(&v["commits"]),
+            commits_cursor: next_cursor(&v["commits"]),
             merge_commit,
             merger: resolved,
         },
@@ -1289,9 +1405,49 @@ pub fn parse_pr(v: &Value) -> Option<PrRecord> {
     rec.checks.rollup = rollup["state"].as_str().map(str::to_string);
     rec.checks.failing = failing_checks(rollup);
     rec.checks.failing_statuses = Some(failing_statuses(rollup));
+    if rec.state == PrState::Open {
+        rec.checks.contexts_cursor = contexts_cursor(head);
+    }
     rec.checks.suites = parse_suites(&head["checkSuites"]);
     rec.checks.suites_total = head["checkSuites"]["totalCount"].as_u64();
     Some(rec)
+}
+
+/// The commits of a `commits` connection of a pull request with
+/// `additions` lines added.
+fn parse_commits(conn: &Value, additions: u64) -> Vec<PrCommit> {
+    conn["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|n| {
+            let c = &n["commit"];
+            let headline = string(&c["messageHeadline"]);
+            let adds = c["additions"].as_u64().unwrap_or(0);
+            PrCommit {
+                oid: string(&c["oid"]),
+                authored_at: time(&c["authoredDate"]),
+                committed_at: time(&c["committedDate"]),
+                additions: adds,
+                deletions: c["deletions"].as_u64().unwrap_or(0),
+                author: login(&c["author"]["user"]),
+                author_email: string(&c["author"]["email"]).to_lowercase(),
+                is_merge: is_merge_commit(&headline, adds, additions),
+                co_authors: parse_co_authors(c["message"].as_str().unwrap_or_default()),
+                reverts: parse_reverts(&headline, c["message"].as_str().unwrap_or_default()),
+                headline,
+            }
+        })
+        .collect()
+}
+
+/// Where the rest of `commit`'s checks start, when they fill more than the
+/// page read.
+fn contexts_cursor(commit: &Value) -> Option<ContextsCursor> {
+    Some(ContextsCursor {
+        commit: commit["id"].as_str()?.to_string(),
+        after: next_cursor(&commit["statusCheckRollup"]["contexts"])?,
+    })
 }
 
 /// The timeline items of a `timelineItems` connection, oldest first.
@@ -1404,7 +1560,7 @@ query($ids: [ID!]!, $tl: Int!) {
 const SWEEP_QUERY: &str = r#"
 query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
-    defaultBranchRef { target { ... on Commit { oid statusCheckRollup { state contexts(first: 30) { pageInfo { hasNextPage } nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
+    defaultBranchRef { target { ... on Commit { id oid statusCheckRollup { state contexts(first: 100) { pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
     pullRequests(states: OPEN, first: 100, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
       totalCount pageInfo { hasNextPage endCursor }
       nodes { id number title author { __typename login } updatedAt isDraft headRefOid mergeable mergeStateStatus maintainerCanModify
@@ -1425,6 +1581,24 @@ query($id: ID!, $after: String) {
 }
 "#;
 
+/// The next page of one pull request's commits.
+const COMMITS_QUERY: &str = r#"
+query($id: ID!, $after: String) {
+  node(id: $id) { ... on PullRequest { commits(first: 100, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { commit { oid authoredDate committedDate additions deletions
+    messageHeadline message author { email name user { login } } } } } } }
+  rateLimit { cost remaining }
+}
+"#;
+
+/// The next page of the checks on one commit.
+const CONTEXTS_QUERY: &str = r#"
+query($id: ID!, $after: String) {
+  node(id: $id) { ... on Commit { statusCheckRollup { state contexts(first: 100, after: $after) { pageInfo { hasNextPage endCursor }
+    nodes { __typename ... on CheckRun { name conclusion status } ... on StatusContext { context state } } } } } }
+  rateLimit { cost remaining }
+}
+"#;
+
 /// The fields of one pull request that the records keep: its own fields,
 /// the head commit's checks, the changed files and commits (with their
 /// messages, for co-author trailers), and the newest `$tl` timeline items.
@@ -1438,10 +1612,10 @@ fragment R on PullRequest {
   assignees(first: 3) { nodes { login } }
   closingIssuesReferences(first: 5) { nodes { number title repository { nameWithOwner } } }
   files(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { path additions deletions } }
-  commits(first: 100) { totalCount nodes { commit { oid authoredDate committedDate additions deletions
+  commits(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { commit { oid authoredDate committedDate additions deletions
     messageHeadline message author { email name user { login } } } } }
-  head: commits(last: 1) { nodes { commit { oid
-    statusCheckRollup { state contexts(first: 20) { nodes { __typename ... on CheckRun { name conclusion status } ... on StatusContext { context state } } } }
+  head: commits(last: 1) { nodes { commit { id oid
+    statusCheckRollup { state contexts(first: 100) { pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name conclusion status } ... on StatusContext { context state } } } }
     checkSuites(first: 8) { totalCount nodes { status conclusion createdAt app { slug } } } } } }
   timelineItems(last: $tl, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW, HEAD_REF_FORCE_PUSHED_EVENT,
       CONVERT_TO_DRAFT_EVENT, READY_FOR_REVIEW_EVENT, CROSS_REFERENCED_EVENT, ASSIGNED_EVENT, CLOSED_EVENT, MERGED_EVENT, REOPENED_EVENT]) {
@@ -2158,6 +2332,206 @@ mod tests {
         caches[0].1.put(again, now);
         assert_eq!(caches[0].1.records[&4].contribution.files.len(), 3);
         assert_eq!(caches[0].1.records[&4].contribution.files_cursor, None);
+    }
+
+    /// The number after `key` in `request`: a `first:` limit, or where one
+    /// of these tests' cursors points.
+    fn number_after(request: &str, key: &str) -> usize {
+        let at = request.find(key).map_or(request.len(), |i| i + key.len());
+        let digits: String = request[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().unwrap_or(0)
+    }
+
+    /// A GraphQL answer with `data`.
+    fn answer(mut data: Value) -> String {
+        data["rateLimit"] = json!({"cost": 1, "remaining": 4000});
+        ok_json(&json!({ "data": data }).to_string())
+    }
+
+    /// Checks `from..` of a commit with `total`, as many as `first` asks
+    /// for. Those in `failing` fail; the others pass.
+    fn contexts(total: usize, failing: &[(usize, &str)], from: usize, first: usize) -> Value {
+        let end = total.min(from + first);
+        let nodes: Vec<Value> = (from..end)
+            .map(|i| {
+                let (name, conclusion) = match failing.iter().find(|(at, _)| *at == i) {
+                    Some((_, name)) => (name.to_string(), "FAILURE"),
+                    None => (format!("check-{i}"), "SUCCESS"),
+                };
+                json!({"__typename": "CheckRun", "name": name, "conclusion": conclusion, "status": "COMPLETED"})
+            })
+            .collect();
+        json!({"pageInfo": {"hasNextPage": end < total, "endCursor": format!("x{end}")}, "nodes": nodes})
+    }
+
+    /// Commits `from..` of a pull request with `total`, as many as `first`
+    /// asks for, by ann, one a minute from 2026-10-16 00:00.
+    fn commits(total: usize, from: usize, first: usize) -> Value {
+        let end = total.min(from + first);
+        let start = t("2026-10-16T00:00:00Z");
+        let nodes: Vec<Value> = (from..end)
+            .map(|i| {
+                let at = (start + chrono::Duration::minutes(i as i64)).to_rfc3339();
+                json!({"commit": {"oid": format!("k{i}"), "authoredDate": at, "committedDate": at,
+                    "additions": 1, "deletions": 0, "messageHeadline": format!("Step {i}"), "message": format!("Step {i}"),
+                    "author": {"email": "ann@example.com", "name": "Ann", "user": {"login": "ann"}}}})
+            })
+            .collect();
+        json!({"totalCount": total, "pageInfo": {"hasNextPage": end < total, "endCursor": format!("k{end}")}, "nodes": nodes})
+    }
+
+    /// #9, open, with 130 commits and 130 checks on its head, of which
+    /// `flaky` (the 4th) and `e2e` (the 121st) fail; the first page of each
+    /// holds as many as `request` asks for.
+    fn long_pr(request: &str) -> Value {
+        let mut n = node(9, "OPEN", "2026-10-17T11:30:00Z");
+        n["headRefOid"] = json!("k129");
+        n["commits"] = commits(130, 0, number_after(request, "commits(first: "));
+        let first = number_after(request, "contexts(first: ");
+        let checks = contexts(130, &LONG_FAILING, 0, first);
+        n["head"] = json!({"nodes": [{"commit": {"id": "C_h9", "oid": "k129",
+            "statusCheckRollup": {"state": "FAILURE", "contexts": checks}}}]});
+        n
+    }
+
+    const LONG_FAILING: [(usize, &str); 2] = [(3, "flaky"), (120, "e2e")];
+
+    #[test]
+    fn commit_and_check_lists_past_the_first_page_are_read() {
+        let dir = std::env::temp_dir().join(format!("craft-prs-lists-{}", std::process::id()));
+        let now = t("2026-10-17T12:00:00Z");
+        let repos = vec!["o/r".to_string()];
+        let mut seen = HashMap::new();
+        seen.insert("o/r".to_string(), Some(seen_at("2026-10-17T11:30:00Z")));
+        backlog(0, now).save(&dir, "o/r").unwrap();
+        let api = crate::tests::routed_stub(|request| {
+            let data = if request.contains("commits(first: 100, after:") {
+                let from = number_after(request, "\"after\":\"k");
+                json!({"node": {"commits": commits(130, from, 100)}})
+            } else if request.contains("contexts(first: 100, after:") {
+                let from = number_after(request, "\"after\":\"x");
+                json!({"node": {"statusCheckRollup": {"contexts": contexts(130, &LONG_FAILING, from, 100)}}})
+            } else {
+                json!({"repository": {"pullRequests": {"pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "nodes": [long_pr(request)]}}})
+            };
+            Some(answer(data))
+        });
+        let gh = GitHub::with_api("t", api).unwrap();
+        let (report, _) = gh.update_prs(&input(&repos, &seen, &dir, now));
+        assert_eq!(report.errors, Vec::<String>::new());
+        let cache = PrCache::load(&dir, "o/r");
+        let rec = &cache.records[&9];
+        assert_eq!(rec.checks.failing, ["flaky", "e2e"]);
+        let c = &rec.contribution;
+        assert_eq!((c.commits.len(), c.commits_total), (130, 130));
+        assert_eq!(
+            c.commits.last().map(|k| k.oid.as_str()),
+            Some("k129"),
+            "the newest push"
+        );
+        assert_eq!(
+            gh.graphql_sent(),
+            3,
+            "the changed list, a commit page and a check page"
+        );
+        assert_eq!(report.list_pages, 2);
+        assert_eq!(c.commits_cursor, None);
+        assert_eq!(rec.checks.contexts_cursor, None);
+        // A later fetch of the same head keeps the commit pages read, and
+        // its check list is read again.
+        let first_pages = long_pr("commits(first: 100) contexts(first: 100)");
+        let mut cache = cache.clone();
+        let again = parse_pr(&first_pages).unwrap();
+        assert_eq!(
+            again.checks.contexts_cursor,
+            Some(ContextsCursor {
+                commit: "C_h9".into(),
+                after: "x100".into()
+            })
+        );
+        cache.put(again, now);
+        let rec = &cache.records[&9];
+        assert_eq!(rec.contribution.commits.len(), 130);
+        assert_eq!(rec.contribution.commits_cursor, None);
+        assert_eq!(rec.checks.failing, ["flaky"]);
+        assert!(rec.checks.contexts_cursor.is_some());
+        // After a force-push to a new head with as many commits, which the
+        // sweep sees first, the pages are read again.
+        let light = Light {
+            id: "PR_9".into(),
+            number: 9,
+            head_ref_oid: "k999".into(),
+            ..Default::default()
+        };
+        cache.records.get_mut(&9).unwrap().apply_light(&light, now);
+        let mut pushed = first_pages;
+        pushed["headRefOid"] = json!("k999");
+        cache.put(parse_pr(&pushed).unwrap(), now);
+        let c = &cache.records[&9].contribution;
+        assert_eq!(c.commits.len(), 100);
+        assert_eq!(c.commits_cursor.as_deref(), Some("k100"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sweep answer with 130 checks on main, of which `flaky` (the 111th)
+    /// fails, as many in the first page as `request` asks for, and no open
+    /// pull request.
+    fn long_main_sweep(request: &str) -> Value {
+        let first = number_after(request, "contexts(first: ");
+        json!({"repository": {
+            "defaultBranchRef": {"target": {"id": "C_main", "oid": "main1", "statusCheckRollup": {"state": "FAILURE",
+                "contexts": contexts(130, &MAIN_FAILING, 0, first)}}},
+            "pullRequests": {"totalCount": 0, "pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []}},
+            "viewer": {"login": "ann"}})
+    }
+
+    const MAIN_FAILING: [(usize, &str); 1] = [(110, "flaky")];
+
+    #[test]
+    fn the_checks_on_main_are_read_past_the_first_page() {
+        let now = t("2026-10-17T12:00:00Z");
+        let api = crate::tests::routed_stub(|request| {
+            let data = if request.contains("contexts(first: 100, after:") {
+                let from = number_after(request, "\"after\":\"x");
+                json!({"node": {"statusCheckRollup": {"contexts": contexts(130, &MAIN_FAILING, from, 100)}}})
+            } else {
+                long_main_sweep(request)
+            };
+            Some(answer(data))
+        });
+        let gh = GitHub::with_api("t", api).unwrap();
+        let mut cache = PrCache::default();
+        assert!(pass(&gh, now).sweep("o/r", &mut cache).unwrap());
+        let main = cache.main_checks.unwrap();
+        assert_eq!(main.failing, ["flaky"]);
+        assert_eq!(
+            main.passing.len(),
+            129,
+            "every page read: the passing checks are kept"
+        );
+        assert_eq!(gh.graphql_sent(), 2, "the sweep and a check page");
+
+        // Below the floor no check page is asked for, and the checks read
+        // before stay.
+        let api = crate::tests::routed_stub(|request| {
+            let mut data = long_main_sweep(request);
+            data["rateLimit"] = json!({"cost": 1, "remaining": 1_000});
+            Some(ok_json(&json!({ "data": data }).to_string()))
+        });
+        let gh = GitHub::with_api("t", api).unwrap();
+        let mut cache = PrCache {
+            main_checks: Some(MainChecks::default()),
+            ..Default::default()
+        };
+        let p = pass(&gh, now);
+        assert!(!p.sweep("o/r", &mut cache).unwrap());
+        assert!(p.report().low_budget);
+        assert_eq!(cache.main_checks, Some(MainChecks::default()));
+        assert_eq!(gh.graphql_sent(), 1);
     }
 
     #[test]

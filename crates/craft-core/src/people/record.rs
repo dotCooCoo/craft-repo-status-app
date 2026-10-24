@@ -103,10 +103,22 @@ pub struct Checks {
     /// The names in `failing` that are commit statuses, not check runs;
     /// `None` in a record that does not say.
     pub failing_statuses: Option<Vec<String>>,
+    /// Where the rest of the head commit's checks start, while `failing`
+    /// holds only the pages read so far.
+    pub contexts_cursor: Option<ContextsCursor>,
     pub suites: Vec<Suite>,
     /// How many check suites the head commit has, of which `suites` holds
     /// the first ones; `None` in a record that does not say.
     pub suites_total: Option<u64>,
+}
+
+/// Where the rest of a commit's checks start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ContextsCursor {
+    /// The commit's node id.
+    pub commit: String,
+    pub after: String,
 }
 
 /// One check suite on the head commit.
@@ -195,9 +207,11 @@ pub struct Contribution {
     /// Where the rest of the file list starts.
     pub files_cursor: Option<String>,
     pub commits: Vec<PrCommit>,
-    /// GitHub's count of commits; more than `commits` holds when the pull
-    /// request has over 100.
+    /// GitHub's count of commits; more than `commits` holds until the rest
+    /// of the list is fetched.
     pub commits_total: u64,
+    /// Where the rest of the commit list starts.
+    pub commits_cursor: Option<String>,
     pub merge_commit: Option<MergeCommit>,
     /// Who landed it: see [`super::merger`].
     pub merger: Option<String>,
@@ -342,6 +356,7 @@ impl PrRecord {
         if new_head {
             self.checks.failing.clear();
             self.checks.failing_statuses = Some(Vec::new());
+            self.checks.contexts_cursor = None;
         }
         // A check suite that failed, recovered or ran again changes the
         // failing names, though the rollup may stay failed.
@@ -391,6 +406,7 @@ impl PrRecord {
         checks.rollup = new.checks.rollup.take();
         checks.failing = std::mem::take(&mut new.checks.failing);
         checks.failing_statuses = new.checks.failing_statuses.take();
+        checks.contexts_cursor = new.checks.contexts_cursor.take();
         checks.suites = std::mem::take(&mut new.checks.suites);
         checks.suites_total = new.checks.suites_total;
         // File pages fetched after the first stay while the head is the same.
@@ -401,6 +417,19 @@ impl PrRecord {
         {
             new.contribution.files = std::mem::take(&mut self.contribution.files);
             new.contribution.files_cursor = self.contribution.files_cursor.take();
+        }
+        // So do commit pages, while the kept list ends at the new head.
+        let (old, fresh) = (&self.contribution, &new.contribution);
+        let ends_at_head = old
+            .commits
+            .last()
+            .is_some_and(|k| k.oid == new.head_ref_oid);
+        if old.commits.len() > fresh.commits.len()
+            && old.commits_total == fresh.commits_total
+            && ends_at_head
+        {
+            new.contribution.commits = std::mem::take(&mut self.contribution.commits);
+            new.contribution.commits_cursor = self.contribution.commits_cursor.take();
         }
         let derived = std::mem::take(&mut self.derived);
         let comments_total = self.comments_total;
@@ -506,8 +535,7 @@ pub struct MainChecks {
     pub oid: String,
     pub rollup: Option<String>,
     pub failing: Vec<String>,
-    /// The checks that passed; empty in caches written before it was kept,
-    /// and when GitHub listed more checks than the sweep reads.
+    /// The checks that passed; empty in caches written before it was kept.
     pub passing: Vec<String>,
     /// In [`PrCache::main_history`]: the first and the last sweep that saw
     /// this commit at the head of the default branch.

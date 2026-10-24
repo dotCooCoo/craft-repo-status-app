@@ -209,7 +209,7 @@ const plainCount = (n: number): HTMLElement => el('span', { class: n ? '' : 'zer
 function rankLines(r: Rank): HTMLElement {
   const notes = [
     r.stacked ? `${r.stacked} merged pull requests credit no lines: every commit was counted in an earlier one (stacked).` : '',
-    r.truncated ? `${r.truncated} merged pull requests have a commit, file or review list the fetch cut short. Over 100 commits credit every line to the author; a file list not read in full counts its unread lines as product lines.` : '',
+    r.truncated ? `${r.truncated} merged pull requests have a commit, file or review list the fetch cut short. A commit list not read in full credits every line to the author; a file list not read in full counts its unread lines as product lines.` : '',
   ].filter(Boolean).join('\n');
   return el('span', { class: notes ? 'flagged' : '', title: notes || null }, linesText(r.added, r.removed));
 }

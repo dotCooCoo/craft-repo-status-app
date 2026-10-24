@@ -181,8 +181,8 @@ the window picked, with a selector for three rankings. Every column sorts.
 A merged pull request's product lines are split over its non-merge commits by
 each commit's share of the commits' lines. A commit that an earlier merged
 pull request in the same repo holds counts there only. A commit without a
-linked account, and a pull request with more than 100 commits, credit their
-share to the author. The type and area come from
+linked account, and a pull request whose commits past the first 100 are not
+read yet, credit their share to the author. The type and area come from
 `crates/craft-core/src/people/kind.rs`: the title's Conventional Commits type
 or `Area:` prefix, `Fix #N:`, the changed paths, refactor and perf words, the
 branch prefix and fix words, in that order. In repos listed in
@@ -353,10 +353,12 @@ need your reply. The tab's badge counts those pull requests.
   requests of a share of the repos so that each is swept every 30 minutes,
   reads the records the sweep found (yours first, then the most recently
   updated), and continues the first load of merged and closed pull
-  requests. Its requests go one at a
+  requests. It reads commit lists and the checks on a head commit in pages
+  of 100, one request a page. Its requests go one at a
   time and only while no repo is being fetched, so they fill the 20 s gaps.
   Each run sends at most 30 requests for the reading, the first load and long
-  file lists, and below 1,500 points left it reads only the changed lists.
+  commit, check and file lists, and below 1,500 points left it reads only the
+  changed lists.
   When GitHub cannot finish a query (a server error, or an error that names
   a timeout), it asks again for a smaller page, or splits the batch in two.
   If GitHub rate-limits one of its requests, fetching
