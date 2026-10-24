@@ -5,7 +5,7 @@ import {
   COLUMNS, RECENT, WINDOWS, MANUAL, windowById, value, orderedEntries, nextSort, dropIndex,
   freshness, ago, totals, urgentAcross, tokenStatus, isRefreshing, formatNum, displayValue, changedCells,
 } from './model.ts';
-import type { Column, Meta, RepoEntry, Snapshot, Sort } from './model.ts';
+import type { Column, Meta, RepoEntry, RepoStats, Snapshot, Sort, Value } from './model.ts';
 
 /** What the UI needs from the host: Tauri commands and events, window chrome. */
 export interface Api {
@@ -69,6 +69,46 @@ const gh = (repo: string, path = ''): string => `https://github.com/${repo}${pat
 const shortName = (repo: string): string => repo.split('/').pop() ?? repo;
 const classes = (...cs: (string | false | null | undefined)[]): string => cs.filter(Boolean).join(' ');
 const DAY = 86400e3;
+const shortSha = (sha: string | null) => sha?.slice(0, 7);
+const isElement = (n: Node): n is Element => n.nodeType === n.ELEMENT_NODE;
+
+function setTitle(n: Element, title: string | null): void {
+  if (title === null) n.removeAttribute('title'); else n.setAttribute('title', title);
+}
+
+/** Puts `node` in `td` unless `td` already holds an equal node. When the two
+ * differ only in the outer element's `title`, the node in `td` stays and
+ * takes the new title. */
+function setCell(td: HTMLTableCellElement, node: Node): void {
+  const old = td.childNodes.length === 1 ? td.firstChild! : null;
+  if (old && isElement(old) && isElement(node)) {
+    const title = node.getAttribute('title');
+    setTitle(node, old.getAttribute('title'));
+    if (old.isEqualNode(node)) { setTitle(old, title); return; }
+    setTitle(node, title);
+  } else if (old?.isEqualNode(node)) return;
+  td.replaceChildren(node);
+}
+
+/** The Repo cell's tooltip: the last attempt's error, no access, or when the data was fetched. */
+function repoTip(entry: RepoEntry): string {
+  if (entry.error) return `Last attempt failed: ${entry.error}`;
+  if (entry.inaccessible) return 'Not accessible (private, or not found)';
+  return entry.fetched_at ? `Fetched ${localTime(entry.fetched_at)}` : 'Not fetched yet';
+}
+
+/** A date column's cell; `oldest_open_pr_at` is marked `old` past 14 days. */
+function dateCell(key: string, v: Value, text: string, now: number): HTMLElement {
+  if (!v) return el('span', { class: 'muted' }, text);
+  const old = key === 'oldest_open_pr_at' && now - Date.parse(String(v)) > 14 * DAY;
+  return el('span', { title: localTime(String(v)), class: old ? 'old' : '' }, text);
+}
+
+/** A footer cell's text: the repo count under the first column, totals under count columns. */
+function footText(c: Column, i: number, repos: number, t: Record<string, number>): string {
+  if (i === 0) return `${repos} repos`;
+  return c.kind === 'num' ? num(Math.round(t[c.key] ?? 0)) : '';
+}
 
 /** The toolbar's refresh arrow, as an element (SVG needs its namespace). */
 function refreshIcon(): SVGSVGElement {
@@ -116,11 +156,7 @@ export function start(api: Api): () => void {
     const text = displayValue(entry, col.key, state.window, now);
     const s = entry.stats;
     if (col.key === 'name') {
-      const tip = entry.error
-        ? `Last attempt failed: ${entry.error}`
-        : entry.inaccessible ? 'Not accessible (private, or not found)'
-        : entry.fetched_at ? `Fetched ${localTime(entry.fetched_at)}` : 'Not fetched yet';
-      return el('span', { class: 'repo', title: tip }, el('span', { class: 'dot' }), appIcon(entry), link(text, gh(entry.repo)));
+      return el('span', { class: 'repo', title: repoTip(entry) }, el('span', { class: 'dot' }), appIcon(entry), link(text, gh(entry.repo)));
     }
     if (!s) return entry.inaccessible ? document.createTextNode(text) : el('span', { class: 'muted' }, text);
     switch (col.key) {
@@ -132,39 +168,45 @@ export function start(api: Api): () => void {
       case 'open_prs': return link(text, gh(entry.repo, '/pulls'));
       case 'open_issues': return link(text, gh(entry.repo, '/issues'));
       case 'recent_commits': case 'recent_prs': case 'recent_merged': case 'recent_issues': case 'recent_people':
-        if (v === null) {
-          const why = state.window === 'release' && !s.latest_build ? 'No release yet' : 'Not fetched yet for this window';
-          return el('span', { class: 'muted', title: why }, text);
-        }
-        return el('span', {
-          class: v ? 'active' : 'zero',
-          title: state.window === 'release' ? `Since ${s.latest_build}, published ${localTime(s.latest_build_at)} (${ago(s.latest_build_at, now)} ago)` : null,
-        }, text);
-      case 'commits_since_build': {
-        const lag = s.since_build;
-        if (!lag) return el('span', { class: 'muted' }, text);
-        const short = (sha: string | null) => sha?.slice(0, 7);
-        const tip = {
-          exact: `${num(v)} commits on main since ${s.latest_build} (${short(lag.from_sha)})`,
-          branched: `${s.latest_build}’s commit isn’t on main: ~${num(v)} commits on main since the two split`,
-          by_date: `${s.latest_build}’s commit shares no history with main: ~${num(v)} commits on main are newer than it`
-            + (lag.from_sha ? `, counted from ${short(lag.from_sha)}` : ''),
-        }[lag.basis];
-        const from = lag.basis === 'by_date' ? lag.from_sha : s.latest_build;
-        return el('span', { title: tip }, from ? link(text, gh(entry.repo, `/compare/${encodeURIComponent(from)}...HEAD`), v ? '' : 'zero') : text);
-      }
-      case 'latest_build':
-        if (!v) return el('span', { class: 'muted' }, text);
-        // The tag is a link, and a pre-release adds a PRE badge after it, matching `text`.
-        return el('span', {}, link(String(v), gh(entry.repo, `/releases/tag/${encodeURIComponent(v)}`)),
-          s.latest_build_prerelease ? el('span', { class: 'pre' }, 'PRE') : null);
+        return recentCell(s, v, text, now);
+      case 'commits_since_build': return sinceBuildCell(entry.repo, s, v, text);
+      case 'latest_build': return latestBuildCell(entry.repo, s, v, text);
     }
-    if (col.kind === 'date') {
-      if (!v) return el('span', { class: 'muted' }, text);
-      const old = col.key === 'oldest_open_pr_at' && now - Date.parse(String(v)) > 14 * DAY;
-      return el('span', { title: localTime(String(v)), class: old ? 'old' : '' }, text);
-    }
+    if (col.kind === 'date') return dateCell(col.key, v, text, now);
     return document.createTextNode(text);
+  }
+
+  /** A recent-activity cell; in the release window its tooltip names the release the count starts at. */
+  function recentCell(s: RepoStats, v: Value, text: string, now: number): HTMLElement {
+    if (v === null) {
+      const why = state.window === 'release' && !s.latest_build ? 'No release yet' : 'Not fetched yet for this window';
+      return el('span', { class: 'muted', title: why }, text);
+    }
+    let tip: string | null = null;
+    if (state.window === 'release') tip = `Since ${s.latest_build}, published ${localTime(s.latest_build_at)} (${ago(s.latest_build_at, now)} ago)`;
+    return el('span', { class: v ? 'active' : 'zero', title: tip }, text);
+  }
+
+  /** The commits-since-release cell: the count links to the compare view, and the tooltip says how it was counted. */
+  function sinceBuildCell(repo: string, s: RepoStats, v: Value, text: string): HTMLElement {
+    const lag = s.since_build;
+    if (!lag) return el('span', { class: 'muted' }, text);
+    const counted = lag.from_sha ? `, counted from ${shortSha(lag.from_sha)}` : '';
+    const tip = {
+      exact: `${num(v)} commits on main since ${s.latest_build} (${shortSha(lag.from_sha)})`,
+      branched: `${s.latest_build}’s commit isn’t on main: ~${num(v)} commits on main since the two split`,
+      by_date: `${s.latest_build}’s commit shares no history with main: ~${num(v)} commits on main are newer than it${counted}`,
+    }[lag.basis];
+    const from = lag.basis === 'by_date' ? lag.from_sha : s.latest_build;
+    if (!from) return el('span', { title: tip }, text);
+    return el('span', { title: tip }, link(text, gh(repo, `/compare/${encodeURIComponent(from)}...HEAD`), v ? '' : 'zero'));
+  }
+
+  /** The latest release cell: the tag is a link, and a pre-release adds a PRE badge after it, matching `text`. */
+  function latestBuildCell(repo: string, s: RepoStats, v: Value, text: string): HTMLElement {
+    if (!v) return el('span', { class: 'muted' }, text);
+    return el('span', {}, link(String(v), gh(repo, `/releases/tag/${encodeURIComponent(v)}`)),
+      s.latest_build_prerelease ? el('span', { class: 'pre' }, 'PRE') : null);
   }
 
   /** The Fetched cell: the data's age and the row's refresh button. The cell
@@ -286,26 +328,6 @@ export function start(api: Api): () => void {
     });
   }
 
-  /** Puts `node` in `td` unless `td` already holds an equal node. When the two
-   * differ only in the outer element's `title`, the node in `td` stays and
-   * takes the new title. */
-  function setCell(td: HTMLTableCellElement, node: Node): void {
-    const old = td.childNodes.length === 1 ? td.firstChild! : null;
-    if (old && isElement(old) && isElement(node)) {
-      const title = node.getAttribute('title');
-      setTitle(node, old.getAttribute('title'));
-      if (old.isEqualNode(node)) { setTitle(old, title); return; }
-      setTitle(node, title);
-    } else if (old?.isEqualNode(node)) return;
-    td.replaceChildren(node);
-  }
-
-  const isElement = (n: Node): n is Element => n.nodeType === n.ELEMENT_NODE;
-
-  function setTitle(n: Element, title: string | null): void {
-    if (title === null) n.removeAttribute('title'); else n.setAttribute('title', title);
-  }
-
   /** How long a changed cell stays highlighted. It matches `td.changed`'s animation in style.css. */
   const FLASH_MS = 2500;
   const flashTimers = new WeakMap<HTMLTableCellElement, ReturnType<typeof setTimeout>>();
@@ -316,7 +338,7 @@ export function start(api: Api): () => void {
     clearTimeout(flashTimers.get(td));
     td.classList.remove('changed');
     td.style.animationDelay = '';
-    void td.offsetWidth; // Forcing a reflow makes the animation start again.
+    td.getBoundingClientRect(); // Forcing a reflow makes the animation start again.
     td.classList.add('changed');
     flashStarts.set(td, Date.now());
     flashTimers.set(td, setTimeout(() => {
@@ -356,8 +378,10 @@ export function start(api: Api): () => void {
   function placeRows(tbody: HTMLElement, want: readonly HTMLTableRowElement[]): void {
     let at = tbody.firstElementChild;
     for (const tr of want) {
-      if (tr === at) at = at.nextElementSibling;
-      else { tbody.insertBefore(tr, at); resumeFlashes(tr.cells); }
+      if (tr === at) { at = at.nextElementSibling; continue; }
+      if (at) at.before(tr);
+      else tbody.append(tr);
+      resumeFlashes(tr.cells);
     }
     while (at) { const next = at.nextElementSibling; at.remove(); at = next; }
   }
@@ -391,7 +415,7 @@ export function start(api: Api): () => void {
     const foot = footRow ??= el('tr', {}, COLUMNS.map((_, i) => el('td', { class: groupStart(i) })));
     if (foot.parentNode !== $('tfoot')) $('tfoot').replaceChildren(foot);
     COLUMNS.forEach((c, i) => {
-      foot.cells[i]!.textContent = i === 0 ? `${snap.repos.length} repos` : c.kind === 'num' ? num(Math.round(t[c.key] ?? 0)) : '';
+      foot.cells[i]!.textContent = footText(c, i, snap.repos.length, t);
     });
   }
 

@@ -363,6 +363,59 @@ test('a link whose address changes is replaced even when its text is the same', 
   assert.equal(h.calls.at(-1)?.args?.url, 'https://github.com/o/alpha/compare/bbbbbbb2...HEAD');
 });
 
+test('cells carry their tooltips, links and marks, and the footer its totals', async () => {
+  const old = new Date(Date.now() - 20 * 86400e3).toISOString();
+  const act = { commits: 3, prs_opened: 0, prs_merged: 0, issues_opened: 0, people: 1 };
+  const h = await setup({ snap: snapshot([
+    repo('alpha', {
+      since_build: { commits: 4, basis: 'exact', from_sha: 'aaaaaaa1bbbb' }, latest_build_prerelease: true,
+      oldest_open_pr_at: old, recent: { release: act },
+    }),
+    repo('beta', { since_build: { commits: 0, basis: 'by_date', from_sha: 'ccccccc3dddd' } }, { error: 'boom' }),
+    repo('gamma', { since_build: { commits: 2, basis: 'by_date', from_sha: null } }, { fetched_at: null }),
+    repo('delta', null, { inaccessible: true }),
+    repo('eps', { latest_build: null }),
+  ]), storage: { window: 'release' } });
+  const at = (name: string, key: string) => h.row(name).cells[column(key)]!;
+  const tip = (name: string, key: string) => (at(name, key).firstChild as HTMLElement).title;
+
+  assert.match(tip('alpha', 'name'), /^Fetched /);
+  assert.equal(tip('beta', 'name'), 'Last attempt failed: boom');
+  assert.equal(tip('gamma', 'name'), 'Not fetched yet');
+  assert.equal(tip('delta', 'name'), 'Not accessible (private, or not found)');
+  assert.equal(at('delta', 'urgency').textContent, '');
+
+  assert.equal(tip('alpha', 'commits_since_build'), '4 commits on main since v1.0.0 (aaaaaaa)');
+  at('alpha', 'commits_since_build').querySelector<HTMLElement>('.link')!.click();
+  assert.equal(h.calls.at(-1)?.args?.url, 'https://github.com/o/alpha/compare/v1.0.0...HEAD');
+  assert.equal(tip('beta', 'commits_since_build'),
+    'v1.0.0’s commit shares no history with main: ~0 commits on main are newer than it, counted from ccccccc');
+  assert.ok(at('beta', 'commits_since_build').querySelector('.link.zero'), 'a zero count is a dimmed link');
+  assert.equal(tip('gamma', 'commits_since_build'), 'v1.0.0’s commit shares no history with main: ~2 commits on main are newer than it');
+  assert.ok(!at('gamma', 'commits_since_build').querySelector('.link'), 'no commit to compare from');
+  assert.equal(at('gamma', 'commits_since_build').textContent, '~2');
+  assert.ok(at('eps', 'commits_since_build').querySelector('.muted'));
+
+  assert.equal(at('alpha', 'latest_build').textContent, 'v1.0.0PRE');
+  assert.ok(at('alpha', 'latest_build').querySelector('.link + .pre'));
+  assert.equal(at('beta', 'latest_build').querySelector('.pre'), null);
+  assert.equal(at('eps', 'latest_build').querySelector('.muted')!.textContent, '—');
+
+  assert.ok(at('alpha', 'oldest_open_pr_at').querySelector('.old'), 'an open PR older than 14 days');
+  assert.equal(at('beta', 'oldest_open_pr_at').querySelector('.old'), null);
+  assert.ok(tip('beta', 'oldest_open_pr_at'));
+
+  assert.match(tip('alpha', 'recent_commits'), /^Since v1\.0\.0, published .+ \(now ago\)$/);
+  assert.ok(at('alpha', 'recent_commits').querySelector('.active'));
+  assert.equal(tip('beta', 'recent_commits'), 'Not fetched yet for this window');
+  assert.equal(tip('eps', 'recent_commits'), 'No release yet');
+
+  const foot = [...h.doc.querySelectorAll('tfoot td')];
+  assert.equal(foot[0]!.textContent, '5 repos');
+  assert.equal(foot[PRS]!.textContent, '4');
+  assert.equal(foot[column('oldest_open_pr_at')]!.textContent, '');
+});
+
 test('rows move to their sorted place without being rebuilt', async () => {
   const h = await setup();
   const before = ['alpha', 'beta', 'gamma'].map((n) => h.row(n));

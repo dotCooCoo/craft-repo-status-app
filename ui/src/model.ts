@@ -355,12 +355,25 @@ export function displayValue(entry: RepoEntry, key: string, window: string, now:
   if (!s) return entry.inaccessible ? '' : '—';
   switch (key) {
     case 'urgency': return String(Math.round(Number(v)));
-    case 'commits_since_build': return s.since_build ? `${s.since_build.basis === 'exact' ? '' : '~'}${formatNum(v)}` : '—';
-    case 'latest_build': return v ? `${v}${s.latest_build_prerelease ? ' PRE' : ''}` : '—';
+    case 'commits_since_build': return lagText(s, v);
+    case 'latest_build': return buildText(s, v);
   }
   if (col?.recent) return v === null ? '—' : formatNum(v);
   if (col?.kind === 'date') return v ? ago(String(v), now) : '—';
   return formatNum(v);
+}
+
+/** The commits-since-release count, with `~` when it is an estimate. */
+function lagText(s: RepoStats, v: Value): string {
+  if (!s.since_build) return '—';
+  const estimate = s.since_build.basis === 'exact' ? '' : '~';
+  return `${estimate}${formatNum(v)}`;
+}
+
+/** The latest release's tag, with ` PRE` after a pre-release. */
+function buildText(s: RepoStats, v: Value): string {
+  if (!v) return '—';
+  return s.latest_build_prerelease ? `${v} PRE` : String(v);
 }
 
 /**
