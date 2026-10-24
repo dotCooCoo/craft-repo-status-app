@@ -1,10 +1,9 @@
 // Craft Status UI: renders the snapshot pushed by the Rust poller. main.ts
 // picks the Tauri API, or a browser stand-in, and calls `start`.
 
-import { checkedAfterFetch, isStale } from './model.ts';
 import {
   COLUMNS, RECENT, WINDOWS, MANUAL, windowById, value, orderedEntries, nextSort, dropIndex,
-  freshness, ago, totals, urgentAcross, tokenStatus, isRefreshing,
+  freshness, ago, totals, urgentAcross, tokenStatus, isRefreshing, checkedAfterFetch, isStale,
 } from './model.ts';
 import type { Column, Meta, RepoEntry, Snapshot, Sort } from './model.ts';
 
