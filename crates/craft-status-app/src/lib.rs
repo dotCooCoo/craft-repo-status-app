@@ -604,12 +604,10 @@ fn woken(
         pacing.forced_since = Some(now);
     }
     // A manual refresh, of everything or of one row, skips the gap or a
-    // token pause, but never a rate-limit backoff. A save skips neither.
-    let manual = if all {
-        fresh
-    } else {
-        wakes.contains(&Wake::Repo)
-    };
+    // token pause, but never a rate-limit backoff. A save skips neither. A
+    // row's refresh counts even when it arrives with a Refresh All that came
+    // too soon after the last one.
+    let manual = (all && fresh) || wakes.contains(&Wake::Repo);
     if manual && pacing.strikes == 0 {
         pacing.not_before = None;
     }
@@ -1052,6 +1050,29 @@ mod tests {
             (None, Some(now), Some(now)),
             "a refresh still refreshes everything"
         );
+    }
+
+    #[test]
+    fn a_row_refresh_skips_the_gap_beside_a_refresh_all_that_came_too_soon() {
+        let now = "2026-10-18T04:20:00Z".parse::<DateTime<Utc>>().unwrap();
+        let gap = now + CDuration::seconds(REPO_GAP);
+        let mut last_manual = Some(now);
+        let mut pacing = Pacing {
+            not_before: Some(gap),
+            ..Pacing::default()
+        };
+        woken(
+            &mut pacing,
+            &mut last_manual,
+            &[Wake::All, Wake::Repo],
+            now + CDuration::seconds(1),
+        );
+        assert_eq!(pacing.not_before, None, "the row refresh skips the gap");
+        assert_eq!(
+            pacing.forced_since, None,
+            "the early Refresh All refetches nothing"
+        );
+        assert_eq!(last_manual, Some(now));
     }
 
     #[test]
