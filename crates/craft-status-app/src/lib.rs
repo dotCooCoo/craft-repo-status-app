@@ -332,21 +332,40 @@ fn needs_reload(seen: Option<SystemTime>, now: Option<SystemTime>, force: bool) 
     force || seen != now
 }
 
+/// Runs `load` when `needs_reload` says so. `seen` takes `now` only when the
+/// load succeeds, so a failed read is tried again even when the file keeps
+/// its modification time.
+fn read_if_changed<T, E>(
+    seen: &mut Option<SystemTime>,
+    now: Option<SystemTime>,
+    force: bool,
+    load: impl FnOnce() -> Result<T, E>,
+) -> Option<Result<T, E>> {
+    if !needs_reload(*seen, now, force) {
+        return None;
+    }
+    let read = load();
+    if read.is_ok() {
+        *seen = now;
+    }
+    Some(read)
+}
+
 /// Re-read the config if it changed on disk, or with `force` in any case: a
 /// Settings save can leave the file with the modification time it had, on a
 /// file system that stores coarse times. A broken file keeps the old config
-/// and surfaces the parse error in the window. The poll thread and a Settings
-/// save both call it; holding `config_mtime` throughout makes one wait for
-/// the other, so an older read never replaces a newer one.
+/// and surfaces the parse error in the window, and the next poll reads it
+/// again. The poll thread and a Settings save both call it; holding
+/// `config_mtime` throughout makes one wait for the other, so an older read
+/// never replaces a newer one.
 fn reload_config_if_changed(app: &AppHandle, force: bool) {
     let state = app.state::<AppState>();
     let mut seen = state.config_mtime.lock().unwrap();
     let mtime = config_mtime();
-    if !needs_reload(*seen, mtime, force) {
+    let Some(read) = read_if_changed(&mut seen, mtime, force, Config::load_or_create) else {
         return;
-    }
-    *seen = mtime;
-    match Config::load_or_create() {
+    };
+    match read {
         Ok(cfg) => {
             {
                 let mut snap = state.snapshot.lock().unwrap();
@@ -1239,6 +1258,20 @@ mod tests {
         assert!(needs_reload(Some(t), Some(t), true), "a save reads it");
         assert!(needs_reload(Some(t), Some(later), false));
         assert!(needs_reload(Some(t), None, false), "the file went away");
+    }
+
+    #[test]
+    fn a_failed_config_read_is_tried_again_at_the_same_time() {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+        let mut seen = None;
+        let broken = read_if_changed(&mut seen, Some(t), false, || Err::<(), _>("parse error"));
+        assert_eq!(broken, Some(Err("parse error")));
+        assert_eq!(seen, None, "a failed read does not record the time");
+        let fixed = read_if_changed(&mut seen, Some(t), false, || Ok::<_, &str>(()));
+        assert_eq!(fixed, Some(Ok(())), "the next poll reads the repaired file");
+        assert_eq!(seen, Some(t));
+        let skipped = read_if_changed(&mut seen, Some(t), false, || Ok::<_, &str>(()));
+        assert_eq!(skipped, None, "a good read is not repeated");
     }
 
     #[test]
