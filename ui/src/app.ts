@@ -409,7 +409,29 @@ export function start(api: Api): () => void {
     document.querySelectorAll<HTMLElement>('.view').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.view === state.view)));
     $('repos-view').hidden = state.view !== 'repos';
     $('urgent-view').hidden = state.view !== 'urgent';
-    if (state.view === 'repos') renderTable(snap); else renderUrgent(snap);
+    if (state.view === 'repos') keepFocus('tbody', () => renderTable(snap));
+    else keepFocus('urgent-list', () => renderUrgent(snap));
+  }
+
+  const FOCUSABLE = 'a[href], button, [tabindex="0"]';
+
+  /** Names a focusable element across rebuilds: its row and its place in the row, or the urgent item's URL. */
+  function focusKey(n: Element): string {
+    const row = n.closest('tr');
+    if (row) return `${row.dataset.repo} ${[...row.querySelectorAll(FOCUSABLE)].indexOf(n)}`;
+    return n.getAttribute('title') ?? '';
+  }
+
+  /** Rebuilds the list `id` and focuses the item that had the focus, or the nearest one left. */
+  function keepFocus(id: string, rebuild: () => void): void {
+    const list = $(id);
+    const active = document.activeElement;
+    if (!active || !list.contains(active)) { rebuild(); return; }
+    const index = [...list.querySelectorAll(FOCUSABLE)].indexOf(active);
+    const key = focusKey(active);
+    rebuild();
+    const after = [...list.querySelectorAll<HTMLElement>(FOCUSABLE)];
+    (after.find((n) => focusKey(n) === key) ?? after[Math.min(index, after.length - 1)])?.focus({ preventScroll: true });
   }
 
   function setView(v: View): void {

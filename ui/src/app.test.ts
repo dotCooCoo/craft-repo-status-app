@@ -356,6 +356,27 @@ test('urgent issues can be reached with Tab and opened with Enter', async () => 
   assert.deepEqual(h.calls.filter((c) => c.cmd === 'open_url').map((c) => c.args?.url), ['https://github.com/o/x/issues/3']);
 });
 
+test('a re-render keeps the keyboard focus on the same link, or moves it to the nearest one left', async () => {
+  const h = await setup();
+  const focused = () => h.doc.activeElement as HTMLElement | null;
+  const link = h.row('gamma').querySelector<HTMLElement>('.repo .link')!;
+  link.focus();
+  h.emit('craft:snapshot', snapshot());
+  assert.notEqual(focused(), link, 'the row was rebuilt');
+  assert.equal(focused()?.getAttribute('href'), 'https://github.com/o/gamma');
+  h.emit('craft:snapshot', snapshot([repo('alpha', { urgency: 100 }), repo('beta', { urgency: 300 })]));
+  assert.equal(focused()?.closest('tr')?.dataset.repo, 'o/alpha');
+  assert.equal(focused()?.getAttribute('href'), 'https://github.com/o/alpha');
+
+  h.doc.querySelector<HTMLElement>('[data-view="urgent"]')!.click();
+  h.emit('craft:snapshot', snapshot());
+  h.doc.querySelectorAll<HTMLElement>('.urgent-item')[1]!.focus();
+  h.emit('craft:snapshot', snapshot());
+  assert.equal(focused()?.title, 'https://github.com/o/x/issues/3');
+  h.emit('craft:snapshot', snapshot([repo('alpha', { urgent: [issue(1, 80, true), issue(2, 20, false)] })]));
+  assert.equal(focused()?.title, 'https://github.com/o/x/issues/2');
+});
+
 // ───────────────────────────── host ─────────────────────────────
 
 test('keyboard shortcuts and buttons call the host', async () => {
