@@ -526,6 +526,10 @@ mod tests {
             refresh_tx: Mutex::new(None),
             window_state: Mutex::new(None),
             window_dirty: AtomicBool::new(false),
+            rebuilding: AtomicBool::new(false),
+            show_on_ready: AtomicBool::new(false),
+            shrink_check_pending: AtomicBool::new(false),
+            last_rebuild: Mutex::new(None),
         };
         let result = Ok(open(&["acme/hidden", "acme/new"]));
         record(&state, &mut found, &owner, result, None, Utc::now());
@@ -549,6 +553,10 @@ mod tests {
             refresh_tx: Mutex::new(None),
             window_state: Mutex::new(None),
             window_dirty: AtomicBool::new(false),
+            rebuilding: AtomicBool::new(false),
+            show_on_ready: AtomicBool::new(false),
+            shrink_check_pending: AtomicBool::new(false),
+            last_rebuild: Mutex::new(None),
         };
         let now = Utc::now();
         let refused = GhError::GraphQl("the listed users cannot be searched".into());
@@ -597,6 +605,10 @@ mod tests {
             refresh_tx: Mutex::new(None),
             window_state: Mutex::new(None),
             window_dirty: AtomicBool::new(false),
+            rebuilding: AtomicBool::new(false),
+            show_on_ready: AtomicBool::new(false),
+            shrink_check_pending: AtomicBool::new(false),
+            last_rebuild: Mutex::new(None),
         };
         let now = Utc::now();
         let no_login = GhError::GraphQl("no viewer.login".into());
@@ -631,6 +643,10 @@ mod tests {
                 refresh_tx: Mutex::new(None),
                 window_state: Mutex::new(None),
                 window_dirty: AtomicBool::new(false),
+                rebuilding: AtomicBool::new(false),
+                show_on_ready: AtomicBool::new(false),
+                shrink_check_pending: AtomicBool::new(false),
+                last_rebuild: Mutex::new(None),
             };
             for _ in 0..MISSES {
                 let acme = next_owner(&mut found, &cfg, now).unwrap();
