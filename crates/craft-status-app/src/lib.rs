@@ -144,7 +144,7 @@ fn is_github_link(url: &str) -> bool {
 
 #[cfg(test)]
 mod link_tests {
-    use super::is_github_link;
+    use super::{is_github_link, open_url};
 
     #[test]
     fn opens_only_well_formed_github_links() {
@@ -167,6 +167,15 @@ mod link_tests {
             let url = format!("https://github.com/o/app#a{bad}z");
             assert!(!is_github_link(&url), "{url:?}");
         }
+    }
+
+    #[test]
+    fn open_url_refuses_a_link_before_opening_it() {
+        let url = "https://github.com/o/app#a|z";
+        assert_eq!(
+            open_url(url.to_string()),
+            Err(format!("refusing to open {url:?}"))
+        );
     }
 }
 
