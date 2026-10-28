@@ -241,6 +241,7 @@ export function start(api: Api): () => void {
 
   function renderTable(snap: Snapshot): void {
     renderHead();
+    const restoreFocus = holdFocus($('tbody'));
     const rows = orderedEntries(snap.repos, state.sort, state.order, state.window);
     const now = Date.now();
     $('tbody').replaceChildren(...rows.map((e) => {
@@ -260,9 +261,32 @@ export function start(api: Api): () => void {
     if (!rows.length) {
       $('tbody').replaceChildren(el('tr', {}, el('td', { colspan: COLUMNS.length, class: 'empty' }, 'No repositories configured — Edit config.')));
     }
+    restoreFocus();
     const t = totals(snap.repos, state.window);
     $('tfoot').replaceChildren(el('tr', {}, COLUMNS.map((c, i) =>
       el('td', { class: groupStart(i) }, i === 0 ? `${snap.repos.length} repos` : c.kind === 'num' ? num(Math.round(t[c.key] ?? 0)) : ''))));
+  }
+
+  const FOCUSABLE = 'a[href], button, [tabindex="0"]';
+
+  /** Names a focusable element across rebuilds: its row and its place in the row, or the urgent item's URL. */
+  function focusKey(n: Element): string {
+    const row = n.closest('tr');
+    if (row) return `${row.dataset.repo} ${[...row.querySelectorAll(FOCUSABLE)].indexOf(n)}`;
+    return n.getAttribute('title') ?? '';
+  }
+
+  /** Notes the focused element in `list`. The returned function, called after `list` is rebuilt,
+   * focuses the same element again, or the one now at its position, or the last one. */
+  function holdFocus(list: HTMLElement): () => void {
+    const active = document.activeElement;
+    if (!active || !list.contains(active)) return () => {};
+    const index = [...list.querySelectorAll(FOCUSABLE)].indexOf(active);
+    const key = focusKey(active);
+    return () => {
+      const after = [...list.querySelectorAll<HTMLElement>(FOCUSABLE)];
+      (after.find((n) => focusKey(n) === key) ?? after[Math.min(index, after.length - 1)])?.focus({ preventScroll: true });
+    };
   }
 
   // ───────────────────────────── row dragging ─────────────────────────────
@@ -336,6 +360,7 @@ export function start(api: Api): () => void {
       ...snap.repos.map((r) => el('option', { value: r.repo }, shortName(r.repo))));
     sel.value = state.urgentRepo;
     $<HTMLInputElement>('critical-only').checked = state.criticalOnly;
+    const restoreFocus = holdFocus($('urgent-list'));
     const items = urgentAcross(snap.repos, { repo: state.urgentRepo, criticalOnly: state.criticalOnly });
     const SEVERE = /crash|panic|freeze|hang|data loss|corruption|won't|blank|security/;
     $('urgent-list').replaceChildren(...items.map((u) => {
@@ -353,6 +378,7 @@ export function start(api: Api): () => void {
             u.labels.filter((l) => !u.reasons.includes(`${l} label`)).map((l) => el('span', { class: 'reason' }, l)))),
         el('span', { class: 'u-age', title: `Opened ${localTime(u.created_at)}` }, ago(u.created_at)));
     }));
+    restoreFocus();
     if (!items.length) {
       $('urgent-list').replaceChildren(el('li', { class: 'empty' }, snap.repos.some((r) => r.stats) ? 'Nothing urgent. 🎉' : 'Waiting for the first poll…'));
     }
@@ -409,29 +435,7 @@ export function start(api: Api): () => void {
     document.querySelectorAll<HTMLElement>('.view').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.view === state.view)));
     $('repos-view').hidden = state.view !== 'repos';
     $('urgent-view').hidden = state.view !== 'urgent';
-    if (state.view === 'repos') keepFocus('tbody', () => renderTable(snap));
-    else keepFocus('urgent-list', () => renderUrgent(snap));
-  }
-
-  const FOCUSABLE = 'a[href], button, [tabindex="0"]';
-
-  /** Names a focusable element across rebuilds: its row and its place in the row, or the urgent item's URL. */
-  function focusKey(n: Element): string {
-    const row = n.closest('tr');
-    if (row) return `${row.dataset.repo} ${[...row.querySelectorAll(FOCUSABLE)].indexOf(n)}`;
-    return n.getAttribute('title') ?? '';
-  }
-
-  /** Rebuilds the list `id` and focuses the item that had the focus, or the nearest one left. */
-  function keepFocus(id: string, rebuild: () => void): void {
-    const list = $(id);
-    const active = document.activeElement;
-    if (!active || !list.contains(active)) { rebuild(); return; }
-    const index = [...list.querySelectorAll(FOCUSABLE)].indexOf(active);
-    const key = focusKey(active);
-    rebuild();
-    const after = [...list.querySelectorAll<HTMLElement>(FOCUSABLE)];
-    (after.find((n) => focusKey(n) === key) ?? after[Math.min(index, after.length - 1)])?.focus({ preventScroll: true });
+    if (state.view === 'repos') renderTable(snap); else renderUrgent(snap);
   }
 
   function setView(v: View): void {
